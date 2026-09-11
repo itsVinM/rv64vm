@@ -3,13 +3,63 @@ use crate::cpu::csr::{
     MSTATUS_MIE, MSTATUS_MPIE, MSTATUS_MPP, MSTATUS_SIE, MSTATUS_SPIE, MSTATUS_SPP, SATP_MODE_BARE,
     SATP_MODE_SV39, SATP_PPN,
 };
-use crate::cpu::decoder::Inst;
-use crate::mmu::Mmu as Bus;
+use crate::cpu::decoder::{AmoOp, BOp, COp, Inst, IOp, LOp, ROp, SOp};
+use crate::cpu::Cpu;
+use crate::Bus;
 use crate::traps::TrapCause;
 
 fn sext32(x: u32) -> u64 {
     (x as i32) as i64 as u64
 }
+// Signed div/rem honoring RISC-V edge cases: X / 0 -> -1, MIN / -1 -> MIN,
+// X rem 0 -> X, MIN rem -1 -> 0.
+fn div64(a: u64, b: u64) -> u64 {
+    let (a, b) = (a as i64, b as i64);
+    if b == 0 {
+        u64::MAX
+    } else if a == i64::MIN && b == -1 {
+        i64::MIN as u64
+    } else {
+        (a / b) as u64
+    }
+}
+fn rem64(a: u64, b: u64) -> u64 {
+    let (a, b) = (a as i64, b as i64);
+    if b == 0 {
+        a as u64
+    } else if a == i64::MIN && b == -1 {
+        0
+    } else {
+        (a % b) as u64
+    }
+}
+fn div32(a: u64, b: u64) -> u64 {
+    let (a, b) = (a as i32, b as i32);
+    if b == 0 {
+        u64::MAX
+    } else if a == i32::MIN && b == -1 {
+        a as i64 as u64
+    } else {
+        (a / b) as i64 as u64
+    }
+}
+fn rem32(a: u64, b: u64) -> u64 {
+    let (a, b) = (a as i32, b as i32);
+    if b == 0 {
+        a as i64 as u64
+    } else if a == i32::MIN && b == -1 {
+        0
+    } else {
+        (a % b) as i64 as u64
+    }
+}
+
+/// Sign-extend `v` from `w` bits (8/16/32; 64 is a no-op).
+#[inline(always)]
+fn sext(v: u64, w: u64) -> u64 {
+    ((v << (64 - w)) as i64 >> (64 - w)) as u64
+}
+
 
 pub struct ExecResult {
     pub next_pc: u64,
@@ -42,10 +92,10 @@ const PTE_U: u64 = 1 << 4;
 const _PTE_A: u64 = 1 << 6;
 const _PTE_D: u64 = 1 << 7;
 
-fn translate(
+fn translate<B: Bus>(
     va: u64,
     priv_level: Privilege,
-    bus: &Bus,
+    bus: &B,
     satp: u64,
     mstatus: u64,
     access_type: AccessType,
@@ -69,10 +119,10 @@ fn translate(
     let mut pte_addr = (root_ppn << 12) + (vpn(2) << 3);
     let mut pte = bus
         .read_phys64(pte_addr)
-        .map_err(|_| TrapCause::LoadPageFault)?;
+        .map_err(|_| page_fault(access_type))?;
 
     if pte & 1 == 0 {
-        return Err(TrapCause::LoadPageFault);
+        return Err(page_fault(access_type));
     }
 
     // Level at which the leaf PTE was found (2 = gigapage, 1 = megapage,
@@ -86,15 +136,15 @@ fn translate(
         pte_addr = (ppn << 12) + (vpn(level) << 3);
         pte = bus
             .read_phys64(pte_addr)
-            .map_err(|_| TrapCause::LoadPageFault)?;
+            .map_err(|_| page_fault(access_type))?;
         if pte & 1 == 0 {
-            return Err(TrapCause::LoadPageFault);
+            return Err(page_fault(access_type));
         }
         leaf_level = level;
     }
 
     if pte & (PTE_R | PTE_W | PTE_X) == 0 {
-        return Err(TrapCause::LoadPageFault);
+        return Err(page_fault(access_type));
     }
 
     // Permission check with SUM and MXR
@@ -103,15 +153,16 @@ fn translate(
     let writable = pte & (PTE_R | PTE_W) == (PTE_R | PTE_W);
 
     if priv_level == Privilege::U && !user_page {
-        return Err(TrapCause::LoadPageFault);
+        return Err(page_fault(access_type));
     }
     if priv_level == Privilege::S && user_page && sum == 0 {
-        return Err(TrapCause::LoadPageFault);
+        return Err(page_fault(access_type));
     }
 
     match access_type {
-        AccessType::Read if !readable => return Err(TrapCause::LoadPageFault),
-        AccessType::Write if !writable => return Err(TrapCause::StorePageFault),
+        AccessType::Fetch if pte & PTE_X == 0 => return Err(page_fault(access_type)),
+        AccessType::Read if !readable => return Err(page_fault(access_type)),
+        AccessType::Write if !writable => return Err(page_fault(access_type)),
         _ => {}
     }
 
@@ -123,19 +174,68 @@ fn translate(
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum AccessType {
+pub(crate) enum AccessType {
+    Fetch,
     Read,
     Write,
 }
 
-pub fn execute(
-    inst: Inst,
-    pc: u64,
-    regs: &mut [u64; 32],
-    csr: &mut CsrFile,
-    bus: &mut Bus,
+/// Map an access kind to the page-fault trap it must raise.
+fn page_fault(access: AccessType) -> TrapCause {
+    match access {
+        AccessType::Fetch => TrapCause::InstructionPageFault,
+        AccessType::Read => TrapCause::LoadPageFault,
+        AccessType::Write => TrapCause::StorePageFault,
+    }
+}
+
+/// Physical address of the next instruction fetch, raising the fetch fault on
+/// a failed walk. Reuses the *same* page walker as data accesses — mod.rs used
+/// to carry a divergent `translate_fetch()` copy that missed SUM/MXR handling.
+pub(crate) fn fetch_phys<B: Bus>(cpu: &Cpu, bus: &B) -> Result<u64, TrapCause> {
+    let csr = &cpu.csr;
+    translate(
+        cpu.pc,
+        cpu.priv_level,
+        bus,
+        csr_satp(csr),
+        csr_mstatus(csr),
+        AccessType::Fetch,
+    )
+}
+
+/// Translate a vaddr, then run `op` on the resulting physical address.
+///
+/// Single funnel for every load / store / AMO:
+///  • translate() raises LoadPageFault / StorePageFault from the page walk,
+///  • the bus-level op raises LoadAccessFault / StoreAccessFault on physical
+///    access failure.
+/// Nothing silently aliases VA→PA anymore (the old `translate(..).unwrap_or(addr)`).
+fn mem_op<T, B: Bus, F>(
+    addr: u64,
     priv_level: Privilege,
-) -> ExecResult {
+    csr: &CsrFile,
+    bus: &mut B,
+    access: AccessType,
+    op: F,
+) -> Result<T, TrapCause>
+where
+    F: FnOnce(&mut B, u64) -> Result<T, TrapCause>,
+{
+    let pa = translate(addr, priv_level, bus, csr_satp(csr), csr_mstatus(csr), access)?;
+    op(bus, pa)
+}
+
+/// Execute one decoded instruction against CPU state and the memory bus.
+///
+/// `cpu` and `bus` are *independent* mutable borrows (the borrow checker keeps
+/// the VM state apart from RAM), so this stays sound under `no_std` and never
+/// needs interior mutability.
+pub fn execute<B: Bus>(cpu: &mut Cpu, bus: &mut B, inst: Inst) -> ExecResult {
+    let pc = cpu.pc;
+    let priv_level = cpu.priv_level;
+    let regs = &mut cpu.regs;
+    let csr = &mut cpu.csr;
     let mut next_pc = pc.wrapping_add(4);
     let mut trap: Option<TrapCause> = None;
     let mut halt = false;
@@ -168,492 +268,176 @@ pub fn execute(
             set!(rd, t);
         }
 
-        Inst::Beq { rs1, rs2, imm } => {
-            if reg!(rs1) == reg!(rs2) {
-                next_pc = pc.wrapping_add(imm as u64);
-            }
-        }
-        Inst::Bne { rs1, rs2, imm } => {
-            if reg!(rs1) != reg!(rs2) {
-                next_pc = pc.wrapping_add(imm as u64);
-            }
-        }
-        Inst::Blt { rs1, rs2, imm } => {
-            if (reg!(rs1) as i64) < (reg!(rs2) as i64) {
-                next_pc = pc.wrapping_add(imm as u64);
-            }
-        }
-        Inst::Bge { rs1, rs2, imm } => {
-            if (reg!(rs1) as i64) >= (reg!(rs2) as i64) {
-                next_pc = pc.wrapping_add(imm as u64);
-            }
-        }
-        Inst::Bltu { rs1, rs2, imm } => {
-            if reg!(rs1) < reg!(rs2) {
-                next_pc = pc.wrapping_add(imm as u64);
-            }
-        }
-        Inst::Bgeu { rs1, rs2, imm } => {
-            if reg!(rs1) >= reg!(rs2) {
+        Inst::Branch { op, rs1, rs2, imm } => {
+            if match op {
+                BOp::Beq => reg!(rs1) == reg!(rs2),
+                BOp::Bne => reg!(rs1) != reg!(rs2),
+                BOp::Blt => (reg!(rs1) as i64) < (reg!(rs2) as i64),
+                BOp::Bge => (reg!(rs1) as i64) >= (reg!(rs2) as i64),
+                BOp::Bltu => reg!(rs1) < reg!(rs2),
+                BOp::Bgeu => reg!(rs1) >= reg!(rs2),
+            } {
                 next_pc = pc.wrapping_add(imm as u64);
             }
         }
 
-        Inst::Lb { rd, rs1, imm } => {
+        Inst::Load { op, rd, rs1, imm } => {
             let addr = reg!(rs1).wrapping_add(imm as u64);
-            let pa = translate(
-                addr,
-                priv_level,
-                bus,
-                csr_satp(csr),
-                csr_mstatus(csr),
-                AccessType::Read,
-            )
-            .unwrap_or(addr);
-            match bus.read8(pa) {
-                Ok(v) => set!(rd, v as i8 as i64 as u64),
+            let (w, se) = match op {
+                LOp::Lb => (8, true),
+                LOp::Lh => (16, true),
+                LOp::Lw => (32, true),
+                LOp::Ld => (64, false),
+                LOp::Lbu => (8, false),
+                LOp::Lhu => (16, false),
+                LOp::Lwu => (32, false),
+            };
+            match mem_op(addr, priv_level, csr, bus, AccessType::Read, |b, pa| match w {
+                8 => b.read8(pa).map(|v| v as u64),
+                16 => b.read16(pa).map(|v| v as u64),
+                32 => b.read32(pa).map(|v| v as u64),
+                _ => b.read64(pa).map(|v| v as u64),
+            }) {
+                Ok(v) => set!(rd, if se { sext(v, w) } else { v }),
                 Err(e) => trap = Some(e),
             }
         }
-        Inst::Lh { rd, rs1, imm } => {
+
+        Inst::Store { op, rs1, rs2, imm } => {
             let addr = reg!(rs1).wrapping_add(imm as u64);
-            let pa = translate(
-                addr,
-                priv_level,
-                bus,
-                csr_satp(csr),
-                csr_mstatus(csr),
-                AccessType::Read,
-            )
-            .unwrap_or(addr);
-            match bus.read16(pa) {
-                Ok(v) => set!(rd, v as i16 as i64 as u64),
-                Err(e) => trap = Some(e),
+            let w = match op {
+                SOp::Sb => 8,
+                SOp::Sh => 16,
+                SOp::Sw => 32,
+                SOp::Sd => 64,
+            };
+            let v = reg!(rs2);
+            if let Err(e) = mem_op(addr, priv_level, csr, bus, AccessType::Write, |b, pa| match w {
+                8 => b.write8(pa, v as u8),
+                16 => b.write16(pa, v as u16),
+                32 => b.write32(pa, v as u32),
+                _ => b.write64(pa, v),
+            }) {
+                trap = Some(e);
             }
         }
-        Inst::Lw { rd, rs1, imm } => {
-            let addr = reg!(rs1).wrapping_add(imm as u64);
-            let pa = translate(
-                addr,
-                priv_level,
-                bus,
-                csr_satp(csr),
-                csr_mstatus(csr),
-                AccessType::Read,
-            )
-            .unwrap_or(addr);
-            match bus.read32(pa) {
-                Ok(v) => set!(rd, sext32(v)),
-                Err(e) => trap = Some(e),
-            }
+
+        Inst::IAlu { op, rd, rs1, imm } => {
+            let x = reg!(rs1);
+            let u = imm as u64;
+            let v = match op {
+                IOp::Addi => x.wrapping_add(u),
+                IOp::Slti => ((x as i64) < imm) as u64,
+                IOp::Sltiu => (x < u) as u64,
+                IOp::Xori => x ^ u,
+                IOp::Ori => x | u,
+                IOp::Andi => x & u,
+                IOp::Slli => x << u,
+                IOp::Srli => x >> u,
+                IOp::Srai => ((x as i64) >> u) as u64,
+                IOp::Addiw => sext32(x.wrapping_add(u) as u32),
+                IOp::Slliw => sext32((x as u32) << u),
+                IOp::Srliw => sext32((x as u32) >> u),
+                IOp::Sraiw => ((x as i32) >> u) as i64 as u64,
+            };
+            set!(rd, v);
         }
-        Inst::Ld { rd, rs1, imm } => {
-            let addr = reg!(rs1).wrapping_add(imm as u64);
-            let pa = translate(
-                addr,
-                priv_level,
-                bus,
-                csr_satp(csr),
-                csr_mstatus(csr),
-                AccessType::Read,
-            )
-            .unwrap_or(addr);
-            match bus.read64(pa) {
+
+        Inst::RR { op, rd, rs1, rs2 } => {
+            let a = reg!(rs1);
+            let b = reg!(rs2);
+            let sh = b & 63;
+            let shw = b & 31;
+            let v = match op {
+                ROp::Add => a.wrapping_add(b),
+                ROp::Sub => a.wrapping_sub(b),
+                ROp::Sll => a << sh,
+                ROp::Slt => ((a as i64) < (b as i64)) as u64,
+                ROp::Sltu => (a < b) as u64,
+                ROp::Xor => a ^ b,
+                ROp::Srl => a >> sh,
+                ROp::Sra => ((a as i64) >> sh) as u64,
+                ROp::Or => a | b,
+                ROp::And => a & b,
+                ROp::Addw => sext32(a.wrapping_add(b) as u32),
+                ROp::Subw => sext32(a.wrapping_sub(b) as u32),
+                ROp::Sllw => sext32((a as u32) << shw),
+                ROp::Srlw => sext32((a as u32) >> shw),
+                ROp::Sraw => ((a as i32) >> shw) as i64 as u64,
+                ROp::Mul => a.wrapping_mul(b),
+                ROp::Mulh => ((a as i64 as i128 * b as i64 as i128) >> 64) as u64,
+                ROp::Mulhsu => ((a as i64 as i128 * b as u128 as i128) >> 64) as u64,
+                ROp::Mulhu => ((a as u128 * b as u128) >> 64) as u64,
+                ROp::Div => div64(a, b),
+                ROp::Divu => a.checked_div(b).unwrap_or(u64::MAX),
+                ROp::Rem => rem64(a, b),
+                ROp::Remu => {
+                    if b == 0 {
+                        a
+                    } else {
+                        a % b
+                    }
+                },
+                ROp::Mulw => sext32(a.wrapping_mul(b) as u32),
+                ROp::Divw => div32(a, b),
+                ROp::Divuw => sext32((a as u32).checked_div(b as u32).unwrap_or(u32::MAX)),
+                ROp::Remw => rem32(a, b),
+                ROp::Remuw => {
+                    let b32 = b as u32;
+                    sext32(if b32 == 0 { a as u32 } else { a as u32 % b32 })
+                }
+            };
+            set!(rd, v);
+        }
+
+        Inst::Amo { op, rd, rs1, rs2, .. } => {
+            let addr = reg!(rs1);
+            let access = match op {
+                AmoOp::LrW | AmoOp::LrD => AccessType::Read,
+                _ => AccessType::Write,
+            };
+            let r = mem_op(addr, priv_level, csr, bus, access, |b, pa| match op {
+                AmoOp::AmoaddW => {
+                    let old = b.read32(pa)?;
+                    b.write32(pa, old.wrapping_add(reg!(rs2) as u32))?;
+                    Ok(old as i32 as i64 as u64)
+                }
+                AmoOp::AmoswapW => {
+                    let old = b.read32(pa)?;
+                    b.write32(pa, reg!(rs2) as u32)?;
+                    Ok(old as i32 as i64 as u64)
+                }
+                AmoOp::LrW => Ok(b.read32(pa)? as i32 as i64 as u64),
+                AmoOp::ScW => {
+                    b.write32(pa, reg!(rs2) as u32)?;
+                    Ok(0)
+                }
+                AmoOp::LrD => b.read64(pa),
+                AmoOp::ScD => {
+                    b.write64(pa, reg!(rs2))?;
+                    Ok(0)
+                }
+            });
+            match r {
                 Ok(v) => set!(rd, v),
                 Err(e) => trap = Some(e),
             }
         }
-        Inst::Lbu { rd, rs1, imm } => {
-            let addr = reg!(rs1).wrapping_add(imm as u64);
-            let pa = translate(
-                addr,
-                priv_level,
-                bus,
-                csr_satp(csr),
-                csr_mstatus(csr),
-                AccessType::Read,
-            )
-            .unwrap_or(addr);
-            match bus.read8(pa) {
-                Ok(v) => set!(rd, v as u64),
-                Err(e) => trap = Some(e),
-            }
-        }
-        Inst::Lhu { rd, rs1, imm } => {
-            let addr = reg!(rs1).wrapping_add(imm as u64);
-            let pa = translate(
-                addr,
-                priv_level,
-                bus,
-                csr_satp(csr),
-                csr_mstatus(csr),
-                AccessType::Read,
-            )
-            .unwrap_or(addr);
-            match bus.read16(pa) {
-                Ok(v) => set!(rd, v as u64),
-                Err(e) => trap = Some(e),
-            }
-        }
-        Inst::Lwu { rd, rs1, imm } => {
-            let addr = reg!(rs1).wrapping_add(imm as u64);
-            let pa = translate(
-                addr,
-                priv_level,
-                bus,
-                csr_satp(csr),
-                csr_mstatus(csr),
-                AccessType::Read,
-            )
-            .unwrap_or(addr);
-            match bus.read32(pa) {
-                Ok(v) => set!(rd, v as u64),
-                Err(e) => trap = Some(e),
-            }
-        }
 
-        Inst::Sb { rs1, rs2, imm } => {
-            let addr = reg!(rs1).wrapping_add(imm as u64);
-            let pa = translate(
-                addr,
-                priv_level,
-                bus,
-                csr_satp(csr),
-                csr_mstatus(csr),
-                AccessType::Write,
-            )
-            .unwrap_or(addr);
-            if let Err(e) = bus.write8(pa, reg!(rs2) as u8) {
-                trap = Some(e);
-            }
-        }
-        Inst::Sh { rs1, rs2, imm } => {
-            let addr = reg!(rs1).wrapping_add(imm as u64);
-            let pa = translate(
-                addr,
-                priv_level,
-                bus,
-                csr_satp(csr),
-                csr_mstatus(csr),
-                AccessType::Write,
-            )
-            .unwrap_or(addr);
-            if let Err(e) = bus.write16(pa, reg!(rs2) as u16) {
-                trap = Some(e);
-            }
-        }
-        Inst::Sw { rs1, rs2, imm } => {
-            let addr = reg!(rs1).wrapping_add(imm as u64);
-            let pa = translate(
-                addr,
-                priv_level,
-                bus,
-                csr_satp(csr),
-                csr_mstatus(csr),
-                AccessType::Write,
-            )
-            .unwrap_or(addr);
-            if let Err(e) = bus.write32(pa, reg!(rs2) as u32) {
-                trap = Some(e);
-            }
-        }
-        Inst::Sd { rs1, rs2, imm } => {
-            let addr = reg!(rs1).wrapping_add(imm as u64);
-            let pa = translate(
-                addr,
-                priv_level,
-                bus,
-                csr_satp(csr),
-                csr_mstatus(csr),
-                AccessType::Write,
-            )
-            .unwrap_or(addr);
-            if let Err(e) = bus.write64(pa, reg!(rs2)) {
-                trap = Some(e);
-            }
-        }
-
-        Inst::Addi { rd, rs1, imm } => set!(rd, reg!(rs1).wrapping_add(imm as u64)),
-        Inst::Slti { rd, rs1, imm } => set!(rd, ((reg!(rs1) as i64) < imm) as u64),
-        Inst::Sltiu { rd, rs1, imm } => set!(rd, (reg!(rs1) < imm as u64) as u64),
-        Inst::Xori { rd, rs1, imm } => set!(rd, reg!(rs1) ^ imm as u64),
-        Inst::Ori { rd, rs1, imm } => set!(rd, reg!(rs1) | imm as u64),
-        Inst::Andi { rd, rs1, imm } => set!(rd, reg!(rs1) & imm as u64),
-        Inst::Slli { rd, rs1, shamt } => set!(rd, reg!(rs1) << shamt),
-        Inst::Srli { rd, rs1, shamt } => set!(rd, reg!(rs1) >> shamt),
-        Inst::Srai { rd, rs1, shamt } => set!(rd, ((reg!(rs1) as i64) >> shamt) as u64),
-
-        Inst::Add { rd, rs1, rs2 } => set!(rd, reg!(rs1).wrapping_add(reg!(rs2))),
-        Inst::Sub { rd, rs1, rs2 } => set!(rd, reg!(rs1).wrapping_sub(reg!(rs2))),
-        Inst::Sll { rd, rs1, rs2 } => set!(rd, reg!(rs1) << (reg!(rs2) & 63)),
-        Inst::Slt { rd, rs1, rs2 } => set!(rd, ((reg!(rs1) as i64) < (reg!(rs2) as i64)) as u64),
-        Inst::Sltu { rd, rs1, rs2 } => set!(rd, (reg!(rs1) < reg!(rs2)) as u64),
-        Inst::Xor { rd, rs1, rs2 } => set!(rd, reg!(rs1) ^ reg!(rs2)),
-        Inst::Srl { rd, rs1, rs2 } => set!(rd, reg!(rs1) >> (reg!(rs2) & 63)),
-        Inst::Sra { rd, rs1, rs2 } => set!(rd, ((reg!(rs1) as i64) >> (reg!(rs2) & 63)) as u64),
-        Inst::Or { rd, rs1, rs2 } => set!(rd, reg!(rs1) | reg!(rs2)),
-        Inst::And { rd, rs1, rs2 } => set!(rd, reg!(rs1) & reg!(rs2)),
-
-        Inst::Addiw { rd, rs1, imm } => set!(rd, sext32(reg!(rs1).wrapping_add(imm as u64) as u32)),
-        Inst::Slliw { rd, rs1, shamt } => set!(rd, sext32((reg!(rs1) as u32) << shamt)),
-        Inst::Srliw { rd, rs1, shamt } => set!(rd, sext32((reg!(rs1) as u32) >> shamt)),
-        Inst::Sraiw { rd, rs1, shamt } => set!(rd, ((reg!(rs1) as i32) >> shamt) as i64 as u64),
-        Inst::Addw { rd, rs1, rs2 } => set!(
-            rd,
-            sext32((reg!(rs1) as u32).wrapping_add(reg!(rs2) as u32))
-        ),
-        Inst::Subw { rd, rs1, rs2 } => set!(
-            rd,
-            sext32((reg!(rs1) as u32).wrapping_sub(reg!(rs2) as u32))
-        ),
-        Inst::Sllw { rd, rs1, rs2 } => set!(rd, sext32((reg!(rs1) as u32) << (reg!(rs2) & 31))),
-        Inst::Srlw { rd, rs1, rs2 } => set!(rd, sext32((reg!(rs1) as u32) >> (reg!(rs2) & 31))),
-        Inst::Sraw { rd, rs1, rs2 } => {
-            set!(rd, ((reg!(rs1) as i32) >> (reg!(rs2) & 31)) as i64 as u64)
-        }
-
-        Inst::Mul { rd, rs1, rs2 } => set!(rd, reg!(rs1).wrapping_mul(reg!(rs2))),
-        Inst::Mulh { rd, rs1, rs2 } => {
-            let a = reg!(rs1) as i64 as i128;
-            let b = reg!(rs2) as i64 as i128;
-            set!(rd, ((a * b) >> 64) as u64);
-        }
-        Inst::Mulhsu { rd, rs1, rs2 } => {
-            let a = reg!(rs1) as i64 as i128;
-            let b = reg!(rs2) as u128 as i128;
-            set!(rd, ((a * b) >> 64) as u64);
-        }
-        Inst::Mulhu { rd, rs1, rs2 } => {
-            let a = reg!(rs1) as u128;
-            let b = reg!(rs2) as u128;
-            set!(rd, ((a * b) >> 64) as u64);
-        }
-        Inst::Div { rd, rs1, rs2 } => {
-            let a = reg!(rs1) as i64;
-            let b = reg!(rs2) as i64;
-            set!(
-                rd,
-                if b == 0 {
-                    u64::MAX
-                } else if a == i64::MIN && b == -1 {
-                    a as u64
-                } else {
-                    (a / b) as u64
-                }
-            );
-        }
-        Inst::Divu { rd, rs1, rs2 } => {
-            let b = reg!(rs2);
-            set!(rd, reg!(rs1).checked_div(b).unwrap_or(u64::MAX));
-        }
-        Inst::Rem { rd, rs1, rs2 } => {
-            let a = reg!(rs1) as i64;
-            let b = reg!(rs2) as i64;
-            set!(
-                rd,
-                if b == 0 {
-                    a as u64
-                } else if a == i64::MIN && b == -1 {
-                    0
-                } else {
-                    (a % b) as u64
-                }
-            );
-        }
-        Inst::Remu { rd, rs1, rs2 } => {
-            let b = reg!(rs2);
-            set!(rd, if b == 0 { reg!(rs1) } else { reg!(rs1) % b });
-        }
-        Inst::Mulw { rd, rs1, rs2 } => set!(
-            rd,
-            sext32((reg!(rs1) as u32).wrapping_mul(reg!(rs2) as u32))
-        ),
-        Inst::Divw { rd, rs1, rs2 } => {
-            let a = reg!(rs1) as i32;
-            let b = reg!(rs2) as i32;
-            set!(
-                rd,
-                if b == 0 {
-                    u64::MAX
-                } else if a == i32::MIN && b == -1 {
-                    a as i64 as u64
-                } else {
-                    (a / b) as i64 as u64
-                }
-            );
-        }
-        Inst::Divuw { rd, rs1, rs2 } => {
-            let b = reg!(rs2) as u32;
-            let a = reg!(rs1) as u32;
-            set!(rd, sext32(a.checked_div(b).unwrap_or(u32::MAX)));
-        }
-        Inst::Remw { rd, rs1, rs2 } => {
-            let a = reg!(rs1) as i32;
-            let b = reg!(rs2) as i32;
-            set!(
-                rd,
-                if b == 0 {
-                    a as i64 as u64
-                } else if a == i32::MIN && b == -1 {
-                    0
-                } else {
-                    (a % b) as i64 as u64
-                }
-            );
-        }
-        Inst::Remuw { rd, rs1, rs2 } => {
-            let b = reg!(rs2) as u32;
-            set!(
-                rd,
-                if b == 0 {
-                    sext32(reg!(rs1) as u32)
-                } else {
-                    sext32(reg!(rs1) as u32 % b)
-                }
-            );
-        }
-
-        Inst::AmoaddW {
-            rd,
-            rs1,
-            rs2,
-            aq: _,
-            rl: _,
-        } => {
-            let addr = reg!(rs1);
-            let pa = translate(
-                addr,
-                priv_level,
-                bus,
-                csr_satp(csr),
-                csr_mstatus(csr),
-                AccessType::Write,
-            )
-            .unwrap_or(addr);
-            if let Ok(old) = bus.read32(pa) {
-                let sum = old.wrapping_add(reg!(rs2) as u32);
-                if bus.write32(pa, sum).is_ok() {
-                    set!(rd, old as i32 as i64 as u64);
-                } else {
-                    trap = Some(TrapCause::StoreAccessFault);
-                }
+        Inst::Csr { op, rd, src, csr: addr } => {
+            if !csr_access_ok(addr as usize, priv_level) {
+                trap = Some(TrapCause::IllegalInstruction(addr as u32));
             } else {
-                trap = Some(TrapCause::LoadAccessFault);
-            }
-        }
-        Inst::AmoswapW {
-            rd,
-            rs1,
-            rs2,
-            aq: _,
-            rl: _,
-        } => {
-            let addr = reg!(rs1);
-            let pa = translate(
-                addr,
-                priv_level,
-                bus,
-                csr_satp(csr),
-                csr_mstatus(csr),
-                AccessType::Write,
-            )
-            .unwrap_or(addr);
-            if let Ok(old) = bus.read32(pa) {
-                if bus.write32(pa, reg!(rs2) as u32).is_ok() {
-                    set!(rd, old as i32 as i64 as u64);
-                } else {
-                    trap = Some(TrapCause::StoreAccessFault);
-                }
-            } else {
-                trap = Some(TrapCause::LoadAccessFault);
-            }
-        }
-        Inst::LrW {
-            rd,
-            rs1,
-            aq: _,
-            rl: _,
-        } => {
-            let addr = reg!(rs1);
-            let pa = translate(
-                addr,
-                priv_level,
-                bus,
-                csr_satp(csr),
-                csr_mstatus(csr),
-                AccessType::Read,
-            )
-            .unwrap_or(addr);
-            match bus.read32(pa) {
-                Ok(v) => set!(rd, v as i32 as i64 as u64),
-                Err(e) => trap = Some(e),
-            }
-        }
-        Inst::ScW {
-            rd,
-            rs1,
-            rs2,
-            aq: _,
-            rl: _,
-        } => {
-            let addr = reg!(rs1);
-            let pa = translate(
-                addr,
-                priv_level,
-                bus,
-                csr_satp(csr),
-                csr_mstatus(csr),
-                AccessType::Write,
-            )
-            .unwrap_or(addr);
-            if bus.write32(pa, reg!(rs2) as u32).is_ok() {
-                set!(rd, 0);
-            } else {
-                trap = Some(TrapCause::StoreAccessFault);
-            }
-        }
-        Inst::LrD {
-            rd,
-            rs1,
-            aq: _,
-            rl: _,
-        } => {
-            let addr = reg!(rs1);
-            let pa = translate(
-                addr,
-                priv_level,
-                bus,
-                csr_satp(csr),
-                csr_mstatus(csr),
-                AccessType::Read,
-            )
-            .unwrap_or(addr);
-            match bus.read64(pa) {
-                Ok(v) => set!(rd, v),
-                Err(e) => trap = Some(e),
-            }
-        }
-        Inst::ScD {
-            rd,
-            rs1,
-            rs2,
-            aq: _,
-            rl: _,
-        } => {
-            let addr = reg!(rs1);
-            let pa = translate(
-                addr,
-                priv_level,
-                bus,
-                csr_satp(csr),
-                csr_mstatus(csr),
-                AccessType::Write,
-            )
-            .unwrap_or(addr);
-            if bus.write64(pa, reg!(rs2)).is_ok() {
-                set!(rd, 0);
-            } else {
-                trap = Some(TrapCause::StoreAccessFault);
+                let (cop, zimm) = match op {
+                    COp::Csrrw => (CsrOp::Write, reg!(src)),
+                    COp::Csrrs => (CsrOp::Set, reg!(src)),
+                    COp::Csrrc => (CsrOp::Clear, reg!(src)),
+                    COp::Csrrwi => (CsrOp::Write, src as u64),
+                    COp::Csrrsi => (CsrOp::Set, src as u64),
+                    COp::Csrrci => (CsrOp::Clear, src as u64),
+                };
+                let v = csr.read_write(addr as usize, zimm, cop, priv_level);
+                set!(rd, v);
             }
         }
 
@@ -708,69 +492,9 @@ pub fn execute(
             }
         }
 
-        Inst::Csrrw { rd, rs1, csr: addr } => {
-            if !csr_access_ok(addr as usize, priv_level) {
-                trap = Some(TrapCause::IllegalInstruction(addr as u32));
-            } else {
-                let v = csr.read_write(addr as usize, reg!(rs1), CsrOp::Write, priv_level);
-                set!(rd, v);
-            }
-        }
-        Inst::Csrrs { rd, rs1, csr: addr } => {
-            if !csr_access_ok(addr as usize, priv_level) {
-                trap = Some(TrapCause::IllegalInstruction(addr as u32));
-            } else {
-                let v = csr.read_write(addr as usize, reg!(rs1), CsrOp::Set, priv_level);
-                set!(rd, v);
-            }
-        }
-        Inst::Csrrc { rd, rs1, csr: addr } => {
-            if !csr_access_ok(addr as usize, priv_level) {
-                trap = Some(TrapCause::IllegalInstruction(addr as u32));
-            } else {
-                let v = csr.read_write(addr as usize, reg!(rs1), CsrOp::Clear, priv_level);
-                set!(rd, v);
-            }
-        }
-        Inst::Csrrwi {
-            rd,
-            uimm,
-            csr: addr,
-        } => {
-            if !csr_access_ok(addr as usize, priv_level) {
-                trap = Some(TrapCause::IllegalInstruction(addr as u32));
-            } else {
-                let v = csr.read_write(addr as usize, uimm as u64, CsrOp::Write, priv_level);
-                set!(rd, v);
-            }
-        }
-        Inst::Csrrsi {
-            rd,
-            uimm,
-            csr: addr,
-        } => {
-            if !csr_access_ok(addr as usize, priv_level) {
-                trap = Some(TrapCause::IllegalInstruction(addr as u32));
-            } else {
-                let v = csr.read_write(addr as usize, uimm as u64, CsrOp::Set, priv_level);
-                set!(rd, v);
-            }
-        }
-        Inst::Csrrci {
-            rd,
-            uimm,
-            csr: addr,
-        } => {
-            if !csr_access_ok(addr as usize, priv_level) {
-                trap = Some(TrapCause::IllegalInstruction(addr as u32));
-            } else {
-                let v = csr.read_write(addr as usize, uimm as u64, CsrOp::Clear, priv_level);
-                set!(rd, v);
-            }
-        }
-
         Inst::Illegal(raw) => trap = Some(TrapCause::IllegalInstruction(raw)),
     }
+
 
     ExecResult {
         next_pc,
@@ -783,619 +507,172 @@ pub fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cpu::csr::Privilege;
-    use crate::cpu::csr::CSR_MSTATUS;
-    use crate::cpu::decoder::Inst;
+    use crate::cpu::csr::{Privilege, CSR_MSTATUS};
+    use crate::cpu::decoder::{BOp, COp, Inst, IOp, ROp};
     use crate::mmu::Mmu;
+
+    /// Run one inst against a default CSR file; return final regs + result.
+    fn rd(inst: Inst, init: impl FnOnce(&mut [u64; 32])) -> ([u64; 32], ExecResult) {
+        let mut regs = [0; 32];
+        init(&mut regs);
+        let mut csr = CsrFile::new();
+        let res = run(inst, &mut regs, &mut csr);
+        (regs, res)
+    }
 
     fn run(inst: Inst, regs: &mut [u64; 32], csr: &mut CsrFile) -> ExecResult {
         let mut bus = Mmu::new(&[]);
-        execute(inst, 0x1000, regs, csr, &mut bus, Privilege::M)
-    }
-    fn r(val: [u64; 32]) -> [u64; 32] {
-        val
+        let mut cpu = Cpu::new(0);
+        cpu.pc = 0x1000;
+        core::mem::swap(&mut cpu.regs, regs);
+        core::mem::swap(&mut cpu.csr, csr);
+        let res = execute(&mut cpu, &mut bus, inst);
+        core::mem::swap(&mut cpu.regs, regs);
+        core::mem::swap(&mut cpu.csr, csr);
+        res
     }
 
-    // ---- ALU immediate ----
     #[test]
-    fn test_addi_exec() {
-        let mut regs = r([0; 32]);
-        regs[1] = 5;
-        let mut csr = CsrFile::new();
-        let res = run(
-            Inst::Addi {
-                rd: 2,
-                rs1: 1,
-                imm: 3,
-            },
-            &mut regs,
-            &mut csr,
-        );
+    fn alu_imm() {
+        let (regs, _) = rd(Inst::IAlu { op: IOp::Addi, rd: 2, rs1: 1, imm: 3 }, |r| r[1] = 5);
         assert_eq!(regs[2], 8);
-        assert_eq!(res.next_pc, 0x1004);
-    }
-    #[test]
-    fn test_addi_neg() {
-        let mut regs = r([0; 32]);
-        regs[1] = 5;
-        let mut csr = CsrFile::new();
-        run(
-            Inst::Addi {
-                rd: 2,
-                rs1: 1,
-                imm: -3,
-            },
-            &mut regs,
-            &mut csr,
-        );
+        let (regs, _) = rd(Inst::IAlu { op: IOp::Addi, rd: 2, rs1: 1, imm: -3 }, |r| r[1] = 5);
         assert_eq!(regs[2], 2);
-    }
-    #[test]
-    fn test_addi_zero_rd() {
-        let mut regs = r([0; 32]);
-        regs[1] = 5;
-        let mut csr = CsrFile::new();
-        run(
-            Inst::Addi {
-                rd: 0,
-                rs1: 1,
-                imm: 42,
-            },
-            &mut regs,
-            &mut csr,
-        );
-        assert_eq!(regs[0], 0); // x0 stays zero
-    }
-    #[test]
-    fn test_slti_exec() {
-        let mut regs = r([0; 32]);
-        regs[1] = 5;
-        let mut csr = CsrFile::new();
-        run(
-            Inst::Slti {
-                rd: 2,
-                rs1: 1,
-                imm: 10,
-            },
-            &mut regs,
-            &mut csr,
-        );
+        let (regs, _) = rd(Inst::IAlu { op: IOp::Addi, rd: 0, rs1: 1, imm: 42 }, |r| r[1] = 5);
+        assert_eq!(regs[0], 0);
+        let (regs, _) = rd(Inst::IAlu { op: IOp::Slti, rd: 2, rs1: 1, imm: 10 }, |r| r[1] = 5);
         assert_eq!(regs[2], 1);
-        run(
-            Inst::Slti {
-                rd: 2,
-                rs1: 1,
-                imm: 3,
-            },
-            &mut regs,
-            &mut csr,
-        );
+        let (regs, _) = rd(Inst::IAlu { op: IOp::Slti, rd: 2, rs1: 1, imm: 3 }, |r| r[1] = 5);
         assert_eq!(regs[2], 0);
     }
 
-    // ---- ALU register ----
     #[test]
-    fn test_add_exec() {
-        let mut regs = r([0; 32]);
-        regs[1] = 10;
-        regs[2] = 20;
-        let mut csr = CsrFile::new();
-        run(
-            Inst::Add {
-                rd: 3,
-                rs1: 1,
-                rs2: 2,
-            },
-            &mut regs,
-            &mut csr,
-        );
+    fn alu_reg() {
+        let (regs, _) = rd(Inst::RR { op: ROp::Add, rd: 3, rs1: 1, rs2: 2 }, |r| { r[1] = 10; r[2] = 20; });
         assert_eq!(regs[3], 30);
-    }
-    #[test]
-    fn test_sub_exec() {
-        let mut regs = r([0; 32]);
-        regs[1] = 20;
-        regs[2] = 10;
-        let mut csr = CsrFile::new();
-        run(
-            Inst::Sub {
-                rd: 3,
-                rs1: 1,
-                rs2: 2,
-            },
-            &mut regs,
-            &mut csr,
-        );
+        let (regs, _) = rd(Inst::RR { op: ROp::Sub, rd: 3, rs1: 1, rs2: 2 }, |r| { r[1] = 20; r[2] = 10; });
         assert_eq!(regs[3], 10);
-    }
-    #[test]
-    fn test_xor_exec() {
-        let mut regs = r([0; 32]);
-        regs[1] = 0xFF00;
-        regs[2] = 0x0FF0;
-        let mut csr = CsrFile::new();
-        run(
-            Inst::Xor {
-                rd: 3,
-                rs1: 1,
-                rs2: 2,
-            },
-            &mut regs,
-            &mut csr,
-        );
+        let (regs, _) = rd(Inst::RR { op: ROp::Xor, rd: 3, rs1: 1, rs2: 2 }, |r| { r[1] = 0xFF00; r[2] = 0x0FF0; });
         assert_eq!(regs[3], 0xF0F0);
-    }
-    #[test]
-    fn test_or_exec() {
-        let mut regs = r([0; 32]);
-        regs[1] = 0xFF00;
-        regs[2] = 0x0FF0;
-        let mut csr = CsrFile::new();
-        run(
-            Inst::Or {
-                rd: 3,
-                rs1: 1,
-                rs2: 2,
-            },
-            &mut regs,
-            &mut csr,
-        );
+        let (regs, _) = rd(Inst::RR { op: ROp::Or, rd: 3, rs1: 1, rs2: 2 }, |r| { r[1] = 0xFF00; r[2] = 0x0FF0; });
         assert_eq!(regs[3], 0xFFF0);
-    }
-    #[test]
-    fn test_and_exec() {
-        let mut regs = r([0; 32]);
-        regs[1] = 0xFF00;
-        regs[2] = 0x0FF0;
-        let mut csr = CsrFile::new();
-        run(
-            Inst::And {
-                rd: 3,
-                rs1: 1,
-                rs2: 2,
-            },
-            &mut regs,
-            &mut csr,
-        );
+        let (regs, _) = rd(Inst::RR { op: ROp::And, rd: 3, rs1: 1, rs2: 2 }, |r| { r[1] = 0xFF00; r[2] = 0x0FF0; });
         assert_eq!(regs[3], 0x0F00);
     }
 
-    // ---- Shifts ----
     #[test]
-    fn test_slli_exec() {
-        let mut regs = r([0; 32]);
-        regs[1] = 5;
-        let mut csr = CsrFile::new();
-        run(
-            Inst::Slli {
-                rd: 2,
-                rs1: 1,
-                shamt: 3,
-            },
-            &mut regs,
-            &mut csr,
-        );
+    fn shifts() {
+        let (regs, _) = rd(Inst::IAlu { op: IOp::Slli, rd: 2, rs1: 1, imm: 3 }, |r| r[1] = 5);
         assert_eq!(regs[2], 40);
-    }
-    #[test]
-    fn test_srli_exec() {
-        let mut regs = r([0; 32]);
-        regs[1] = 0x100;
-        let mut csr = CsrFile::new();
-        run(
-            Inst::Srli {
-                rd: 2,
-                rs1: 1,
-                shamt: 4,
-            },
-            &mut regs,
-            &mut csr,
-        );
+        let (regs, _) = rd(Inst::IAlu { op: IOp::Srli, rd: 2, rs1: 1, imm: 4 }, |r| r[1] = 0x100);
         assert_eq!(regs[2], 0x10);
-    }
-    #[test]
-    fn test_srai_exec() {
-        let mut regs = r([0; 32]);
-        regs[1] = -256i64 as u64;
-        let mut csr = CsrFile::new();
-        run(
-            Inst::Srai {
-                rd: 2,
-                rs1: 1,
-                shamt: 4,
-            },
-            &mut regs,
-            &mut csr,
-        );
+        let (regs, _) = rd(Inst::IAlu { op: IOp::Srai, rd: 2, rs1: 1, imm: 4 }, |r| r[1] = -256i64 as u64);
         assert_eq!(regs[2] as i64, -16);
     }
 
-    // ---- M-extension ----
     #[test]
-    fn test_mul_exec() {
-        let mut regs = r([0; 32]);
-        regs[1] = 1000;
-        regs[2] = 2000;
-        let mut csr = CsrFile::new();
-        run(
-            Inst::Mul {
-                rd: 3,
-                rs1: 1,
-                rs2: 2,
-            },
-            &mut regs,
-            &mut csr,
-        );
+    fn mul_div() {
+        let (regs, _) = rd(Inst::RR { op: ROp::Mul, rd: 3, rs1: 1, rs2: 2 }, |r| { r[1] = 1000; r[2] = 2000; });
         assert_eq!(regs[3], 2_000_000);
-    }
-    #[test]
-    fn test_mulh_exec() {
-        let mut regs = r([0; 32]);
-        regs[1] = 0xABCD_EF01_2345_6789u64 as i64 as u64;
-        regs[2] = 0x1234_5678_9ABC_DEF0u64 as i64 as u64;
-        let mut csr = CsrFile::new();
-        run(
-            Inst::Mulh {
-                rd: 3,
-                rs1: 1,
-                rs2: 2,
-            },
-            &mut regs,
-            &mut csr,
-        );
+        let (regs, _) = rd(Inst::RR { op: ROp::Mulh, rd: 3, rs1: 1, rs2: 2 }, |r| {
+            r[1] = 0xABCD_EF01_2345_6789u64 as i64 as u64;
+            r[2] = 0x1234_5678_9ABC_DEF0u64 as i64 as u64;
+        });
         let a = regs[1] as i64 as i128;
         let b = regs[2] as i64 as i128;
         assert_eq!(regs[3], ((a * b) >> 64) as u64);
-    }
-    #[test]
-    fn test_divu_exec() {
-        let mut regs = r([0; 32]);
-        regs[1] = 100;
-        regs[2] = 7;
-        let mut csr = CsrFile::new();
-        run(
-            Inst::Divu {
-                rd: 3,
-                rs1: 1,
-                rs2: 2,
-            },
-            &mut regs,
-            &mut csr,
-        );
+        let (regs, _) = rd(Inst::RR { op: ROp::Divu, rd: 3, rs1: 1, rs2: 2 }, |r| { r[1] = 100; r[2] = 7; });
         assert_eq!(regs[3], 14);
-    }
-    #[test]
-    fn test_div_by_zero() {
-        let mut regs = r([0; 32]);
-        regs[1] = 100;
-        regs[2] = 0;
-        let mut csr = CsrFile::new();
-        run(
-            Inst::Div {
-                rd: 3,
-                rs1: 1,
-                rs2: 2,
-            },
-            &mut regs,
-            &mut csr,
-        );
+        let (regs, _) = rd(Inst::RR { op: ROp::Div, rd: 3, rs1: 1, rs2: 2 }, |r| { r[1] = 100; r[2] = 0; });
         assert_eq!(regs[3], u64::MAX);
-    }
-    #[test]
-    fn test_rem_by_zero() {
-        let mut regs = r([0; 32]);
-        regs[1] = 100;
-        regs[2] = 0;
-        let mut csr = CsrFile::new();
-        run(
-            Inst::Rem {
-                rd: 3,
-                rs1: 1,
-                rs2: 2,
-            },
-            &mut regs,
-            &mut csr,
-        );
+        let (regs, _) = rd(Inst::RR { op: ROp::Rem, rd: 3, rs1: 1, rs2: 2 }, |r| { r[1] = 100; r[2] = 0; });
         assert_eq!(regs[3], 100);
-    }
-    #[test]
-    fn test_div_overflow() {
-        let mut regs = r([0; 32]);
-        regs[1] = i64::MIN as u64;
-        regs[2] = -1i64 as u64;
-        let mut csr = CsrFile::new();
-        run(
-            Inst::Div {
-                rd: 3,
-                rs1: 1,
-                rs2: 2,
-            },
-            &mut regs,
-            &mut csr,
-        );
+        let (regs, _) = rd(Inst::RR { op: ROp::Div, rd: 3, rs1: 1, rs2: 2 }, |r| { r[1] = i64::MIN as u64; r[2] = -1i64 as u64; });
         assert_eq!(regs[3], i64::MIN as u64);
     }
 
-    // ---- JAL and branches ----
     #[test]
-    fn test_jal_exec() {
-        let mut regs = r([0; 32]);
-        let mut csr = CsrFile::new();
-        let res = run(Inst::Jal { rd: 1, imm: 0x100 }, &mut regs, &mut csr);
-        assert_eq!(regs[1], 0x1004); // return address = pc+4
+    fn jumps() {
+        let (regs, res) = rd(Inst::Jal { rd: 1, imm: 0x100 }, |_| {});
+        assert_eq!(regs[1], 0x1004);
         assert_eq!(res.next_pc, 0x1100);
-    }
-    #[test]
-    fn test_jalr_exec() {
-        let mut regs = r([0; 32]);
-        regs[2] = 0x2000;
-        let mut csr = CsrFile::new();
-        let res = run(
-            Inst::Jalr {
-                rd: 1,
-                rs1: 2,
-                imm: 0x100,
-            },
-            &mut regs,
-            &mut csr,
-        );
+        let (regs, res) = rd(Inst::Jalr { rd: 1, rs1: 2, imm: 0x100 }, |r| r[2] = 0x2000);
         assert_eq!(regs[1], 0x1004);
         assert_eq!(res.next_pc, 0x2100);
     }
+
     #[test]
-    fn test_beq_taken() {
-        let mut regs = r([0; 32]);
-        regs[1] = 42;
-        regs[2] = 42;
-        let mut csr = CsrFile::new();
-        let res = run(
-            Inst::Beq {
-                rs1: 1,
-                rs2: 2,
-                imm: 0x20,
-            },
-            &mut regs,
-            &mut csr,
-        );
+    fn branches() {
+        let (_, res) = rd(Inst::Branch { op: BOp::Beq, rs1: 1, rs2: 2, imm: 0x20 }, |r| { r[1] = 42; r[2] = 42; });
         assert_eq!(res.next_pc, 0x1020);
-    }
-    #[test]
-    fn test_beq_not_taken() {
-        let mut regs = r([0; 32]);
-        regs[1] = 42;
-        regs[2] = 43;
-        let mut csr = CsrFile::new();
-        let res = run(
-            Inst::Beq {
-                rs1: 1,
-                rs2: 2,
-                imm: 0x20,
-            },
-            &mut regs,
-            &mut csr,
-        );
+        let (_, res) = rd(Inst::Branch { op: BOp::Beq, rs1: 1, rs2: 2, imm: 0x20 }, |r| { r[1] = 42; r[2] = 43; });
         assert_eq!(res.next_pc, 0x1004);
-    }
-    #[test]
-    fn test_blt_taken() {
-        let mut regs = r([0; 32]);
-        regs[1] = 5;
-        regs[2] = 10;
-        let mut csr = CsrFile::new();
-        let res = run(
-            Inst::Blt {
-                rs1: 1,
-                rs2: 2,
-                imm: 0x30,
-            },
-            &mut regs,
-            &mut csr,
-        );
+        let (_, res) = rd(Inst::Branch { op: BOp::Blt, rs1: 1, rs2: 2, imm: 0x30 }, |r| { r[1] = 5; r[2] = 10; });
         assert_eq!(res.next_pc, 0x1030);
-    }
-    #[test]
-    fn test_bge_taken() {
-        let mut regs = r([0; 32]);
-        regs[1] = 10;
-        regs[2] = 5;
-        let mut csr = CsrFile::new();
-        let res = run(
-            Inst::Bge {
-                rs1: 1,
-                rs2: 2,
-                imm: 0x30,
-            },
-            &mut regs,
-            &mut csr,
-        );
+        let (_, res) = rd(Inst::Branch { op: BOp::Bge, rs1: 1, rs2: 2, imm: 0x30 }, |r| { r[1] = 10; r[2] = 5; });
         assert_eq!(res.next_pc, 0x1030);
-    }
-    #[test]
-    fn test_bltu() {
-        let mut regs = r([0; 32]);
-        regs[1] = 5;
-        regs[2] = 10;
-        let mut csr = CsrFile::new();
-        let res = run(
-            Inst::Bltu {
-                rs1: 1,
-                rs2: 2,
-                imm: 0x40,
-            },
-            &mut regs,
-            &mut csr,
-        );
+        let (_, res) = rd(Inst::Branch { op: BOp::Bltu, rs1: 1, rs2: 2, imm: 0x40 }, |r| { r[1] = 5; r[2] = 10; });
         assert_eq!(res.next_pc, 0x1040);
     }
 
-    // ---- LUI and AUIPC ----
     #[test]
-    fn test_lui_exec() {
-        let mut regs = r([0; 32]);
-        let mut csr = CsrFile::new();
-        run(
-            Inst::Lui {
-                rd: 1,
-                imm: 0x12345000,
-            },
-            &mut regs,
-            &mut csr,
-        );
+    fn lui_auipc() {
+        let (regs, _) = rd(Inst::Lui { rd: 1, imm: 0x12345000 }, |_| {});
         assert_eq!(regs[1], 0x12345000);
-    }
-    #[test]
-    fn test_auipc_exec() {
-        let mut regs = r([0; 32]);
-        let mut csr = CsrFile::new();
-        run(Inst::Auipc { rd: 1, imm: 0x1000 }, &mut regs, &mut csr);
-        assert_eq!(regs[1], 0x2000); // pc=0x1000 + imm=0x1000
+        let (regs, _) = rd(Inst::Auipc { rd: 1, imm: 0x1000 }, |_| {});
+        assert_eq!(regs[1], 0x2000);
     }
 
-    // ---- 32-bit ops ----
     #[test]
-    fn test_addiw_exec() {
-        let mut regs = r([0; 32]);
-        regs[1] = 0xFFFF_FFFFu64;
-        let mut csr = CsrFile::new();
-        run(
-            Inst::Addiw {
-                rd: 2,
-                rs1: 1,
-                imm: 1,
-            },
-            &mut regs,
-            &mut csr,
-        );
-        assert_eq!(regs[2], 0); // 0xFFFFFFFF + 1 = 0, sign-extended from 32-bit
-    }
-    #[test]
-    fn test_addw_exec() {
-        let mut regs = r([0; 32]);
-        regs[1] = 0xFFFF_FFFFu64;
-        regs[2] = 2;
-        let mut csr = CsrFile::new();
-        run(
-            Inst::Addw {
-                rd: 3,
-                rs1: 1,
-                rs2: 2,
-            },
-            &mut regs,
-            &mut csr,
-        );
-        assert_eq!(regs[3], 1); // 0xFFFFFFFF + 2 = 1 (32-bit) then sign-extended
-    }
-    #[test]
-    fn test_mulw_exec() {
-        let mut regs = r([0; 32]);
-        regs[1] = 100_000;
-        regs[2] = 200_000;
-        let mut csr = CsrFile::new();
-        run(
-            Inst::Mulw {
-                rd: 3,
-                rs1: 1,
-                rs2: 2,
-            },
-            &mut regs,
-            &mut csr,
-        );
-        assert_eq!(
-            regs[3],
-            ((100_000u64 * 200_000) as u32) as i32 as i64 as u64
-        );
+    fn word_ops() {
+        let (regs, _) = rd(Inst::IAlu { op: IOp::Addiw, rd: 2, rs1: 1, imm: 1 }, |r| r[1] = 0xFFFF_FFFFu64);
+        assert_eq!(regs[2], 0);
+        let (regs, _) = rd(Inst::RR { op: ROp::Addw, rd: 3, rs1: 1, rs2: 2 }, |r| { r[1] = 0xFFFF_FFFFu64; r[2] = 2; });
+        assert_eq!(regs[3], 1);
+        let (regs, _) = rd(Inst::RR { op: ROp::Mulw, rd: 3, rs1: 1, rs2: 2 }, |r| { r[1] = 100_000; r[2] = 200_000; });
+        assert_eq!(regs[3], ((100_000u64 * 200_000) as u32) as i32 as i64 as u64);
     }
 
-    // ---- CSR ----
     #[test]
-    fn test_csrrw_exec() {
-        let mut regs = r([0; 32]);
+    fn csr_rw() {
+        let mut regs = [0; 32];
         regs[10] = 0xABCD;
         let mut csr = CsrFile::new();
-        run(
-            Inst::Csrrw {
-                rd: 1,
-                rs1: 10,
-                csr: 0x300,
-            },
-            &mut regs,
-            &mut csr,
-        );
-        assert_eq!(regs[1], 0); // old mstatus was 0
+        run(Inst::Csr { op: COp::Csrrw, rd: 1, src: 10, csr: 0x300 }, &mut regs, &mut csr);
+        assert_eq!(regs[1], 0);
         assert_eq!(csr.read(CSR_MSTATUS, Privilege::M), 0xABCD);
-    }
-    #[test]
-    fn test_csrrs_exec() {
-        let mut regs = r([0; 32]);
-        regs[10] = 0x80; // MSTATUS.MPIE=1
+
+        let mut regs = [0; 32];
+        regs[10] = 0x80;
         let mut csr = CsrFile::new();
-        run(
-            Inst::Csrrs {
-                rd: 1,
-                rs1: 10,
-                csr: 0x300,
-            },
-            &mut regs,
-            &mut csr,
-        );
-        assert_eq!(regs[1], 0); // old mstatus had no MIE
+        run(Inst::Csr { op: COp::Csrrs, rd: 1, src: 10, csr: 0x300 }, &mut regs, &mut csr);
+        assert_eq!(regs[1], 0);
         assert!(csr.read(CSR_MSTATUS, Privilege::M) & (1 << 7) != 0);
     }
 
-    // ---- System ----
     #[test]
-    fn test_ecall_m() {
-        let mut regs = r([0; 32]);
-        let mut csr = CsrFile::new();
-        let res = run(Inst::Ecall, &mut regs, &mut csr);
+    fn system() {
+        let (_, res) = rd(Inst::Ecall, |_| {});
         assert_eq!(res.trap, Some(TrapCause::EcallFromM));
-    }
-    #[test]
-    fn test_ebreak_halt() {
-        let mut regs = r([0; 32]);
-        let mut csr = CsrFile::new();
-        let res = run(Inst::Ebreak, &mut regs, &mut csr);
+        let (_, res) = rd(Inst::Ebreak, |_| {});
         assert!(res.halt);
-    }
-    #[test]
-    fn test_mret_exec() {
-        let mut regs = r([0; 32]);
-        let mut csr = CsrFile::new();
-        csr.write(CSR_MEPC, 0x2000, Privilege::M);
-        csr.write(CSR_MSTATUS, (3 << 11) | (1 << 7), Privilege::M); // MPP=3 (M), MPIE=1
-        let res = run(Inst::Mret, &mut regs, &mut csr);
-        assert_eq!(res.next_pc, 0x2000);
-    }
-    #[test]
-    fn test_sret_requires_s_mode() {
-        let mut regs = r([0; 32]);
-        let mut csr = CsrFile::new();
-        let mut bus = Mmu::new(&[]);
-        let res = execute(
-            Inst::Sret,
-            0x1000,
-            &mut regs,
-            &mut csr,
-            &mut bus,
-            Privilege::U,
-        );
-        assert_eq!(res.trap, Some(TrapCause::IllegalInstruction(0x10200073)));
-    }
-    #[test]
-    fn test_fence_noop() {
-        let mut regs = r([0; 32]);
-        let mut csr = CsrFile::new();
-        let res = run(Inst::Fence, &mut regs, &mut csr);
+        let (_, res) = rd(Inst::Fence, |_| {});
         assert_eq!(res.next_pc, 0x1004);
         assert!(res.trap.is_none());
-    }
-
-    // ---- Illegal instruction ----
-    #[test]
-    fn test_illegal_trap() {
-        let mut regs = r([0; 32]);
-        let mut csr = CsrFile::new();
-        let res = run(Inst::Illegal(0xFFFFFFFF), &mut regs, &mut csr);
+        let (_, res) = rd(Inst::Illegal(0xFFFFFFFF), |_| {});
         assert_eq!(res.trap, Some(TrapCause::IllegalInstruction(0xFFFFFFFF)));
+
+        let mut regs = [0; 32];
+        let mut csr = CsrFile::new();
+        csr.write(CSR_MEPC, 0x2000, Privilege::M);
+        csr.write(CSR_MSTATUS, (3 << 11) | (1 << 7), Privilege::M);
+        let res = run(Inst::Mret, &mut regs, &mut csr);
+        assert_eq!(res.next_pc, 0x2000);
+
+        let mut cpu = Cpu::new(0);
+        cpu.priv_level = Privilege::U;
+        let mut bus = Mmu::new(&[]);
+        let res = execute(&mut cpu, &mut bus, Inst::Sret);
+        assert_eq!(res.trap, Some(TrapCause::IllegalInstruction(0x10200073)));
     }
 }

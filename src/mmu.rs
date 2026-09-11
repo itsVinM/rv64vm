@@ -1,3 +1,6 @@
+#[cfg(not(feature = "std"))]
+use alloc::{vec, vec::Vec};
+
 use crate::traps::TrapCause;
 use crate::uart;
 use crate::virtio::Virtio;
@@ -360,8 +363,10 @@ impl Mmu {
             }
             CLINT_BASE..=CLINT_END => {
                 let off = addr - CLINT_BASE;
+                #[cfg(feature = "std")]
                 let old = self.clint.mtimecmp;
                 self.clint.write(off, val);
+                #[cfg(feature = "std")]
                 if off == 0x4000 || off == 0x4004 {
                     eprintln!(
                         "CLINT write32 mtimecmp off={:#x}: {:#x} -> {:#x} (old={:#x}) mtime={:#x}",
@@ -404,8 +409,10 @@ impl Mmu {
             }
             CLINT_BASE..=CLINT_END => {
                 let off = addr - CLINT_BASE;
+                #[cfg(feature = "std")]
                 let old = self.clint.mtimecmp;
                 self.clint.write64(off, val);
+                #[cfg(feature = "std")]
                 if off == 0x4000 {
                     eprintln!(
                         "CLINT write64 mtimecmp: {:#x} -> {:#x} (old={:#x}) mtime={:#x}",
@@ -419,5 +426,56 @@ impl Mmu {
                 self.write32(addr + 4, (val >> 32) as u32)
             }
         }
+    }
+}
+
+impl crate::Bus for Mmu {
+    fn read8(&self, addr: u64) -> Result<u8, TrapCause> {
+        self.read8(addr)
+    }
+    fn read16(&self, addr: u64) -> Result<u16, TrapCause> {
+        self.read16(addr)
+    }
+    fn read32(&self, addr: u64) -> Result<u32, TrapCause> {
+        self.read32(addr)
+    }
+    fn read64(&self, addr: u64) -> Result<u64, TrapCause> {
+        self.read64(addr)
+    }
+    fn write8(&mut self, addr: u64, val: u8) -> Result<(), TrapCause> {
+        self.write8(addr, val)
+    }
+    fn write16(&mut self, addr: u64, val: u16) -> Result<(), TrapCause> {
+        self.write16(addr, val)
+    }
+    fn write32(&mut self, addr: u64, val: u32) -> Result<(), TrapCause> {
+        self.write32(addr, val)
+    }
+    fn write64(&mut self, addr: u64, val: u64) -> Result<(), TrapCause> {
+        self.write64(addr, val)
+    }
+    fn read_phys64(&self, addr: u64) -> Result<u64, TrapCause> {
+        self.read_phys64(addr)
+    }
+    fn tick(&mut self) {
+        self.tick()
+    }
+    fn timer_pending(&self) -> bool {
+        self.clint.timer_pending()
+    }
+    fn softint_pending(&self) -> bool {
+        self.clint.softint_pending()
+    }
+    fn mtime(&self) -> u64 {
+        self.clint.mtime
+    }
+    fn set_mtimecmp(&mut self, v: u64) {
+        self.clint.mtimecmp = v;
+    }
+    fn has_pending_plic_s(&self) -> bool {
+        self.has_pending_plic_s()
+    }
+    fn read_uart(&mut self) -> &str {
+        self.uart.flush()
     }
 }

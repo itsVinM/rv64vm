@@ -1,5 +1,8 @@
 // Minimal Flattened Device Tree generator — builds a valid DTB blob in memory.
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 const FDT_MAGIC: u32 = 0xD00DFEED;
 const FDT_VERSION: u32 = 17;
 const FDT_COMPAT: u32 = 16;

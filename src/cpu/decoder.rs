@@ -1,394 +1,123 @@
-/// All RISC-V instruction formats decoded via bit manipulation (no string parsing).
+/// RISC-V decoder: `decode()` is a single table lookup into per-format
+/// functions. `Inst` groups the ~70 opcodes into a handful of format-carrier
+/// variants; each carrier holds a tiny op enum decoded from funct3/funct7, so
+/// decoding stays exhaustive without a 70-arm match.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BOp {
+    Beq,
+    Bne,
+    Blt,
+    Bge,
+    Bltu,
+    Bgeu,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LOp {
+    Lb,
+    Lh,
+    Lw,
+    Ld,
+    Lbu,
+    Lhu,
+    Lwu,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SOp {
+    Sb,
+    Sh,
+    Sw,
+    Sd,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IOp {
+    Addi,
+    Slti,
+    Sltiu,
+    Xori,
+    Ori,
+    Andi,
+    Slli,
+    Srli,
+    Srai,
+    Addiw,
+    Slliw,
+    Srliw,
+    Sraiw,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ROp {
+    Add,
+    Sub,
+    Sll,
+    Slt,
+    Sltu,
+    Xor,
+    Srl,
+    Sra,
+    Or,
+    And,
+    Addw,
+    Subw,
+    Sllw,
+    Srlw,
+    Sraw,
+    Mul,
+    Mulh,
+    Mulhsu,
+    Mulhu,
+    Div,
+    Divu,
+    Rem,
+    Remu,
+    Mulw,
+    Divw,
+    Divuw,
+    Remw,
+    Remuw,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmoOp {
+    AmoaddW,
+    AmoswapW,
+    LrW,
+    ScW,
+    LrD,
+    ScD,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum COp {
+    Csrrw,
+    Csrrs,
+    Csrrc,
+    Csrrwi,
+    Csrrsi,
+    Csrrci,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Inst {
-    // RV64I — Lui/Auipc handled manually (imm >> 12 transform)
-    Lui {
-        rd: u8,
-        imm: i64,
-    },
-    // A extension (atomics) — no disassembly yet
-    AmoaddW {
-        rd: u8,
-        rs1: u8,
-        rs2: u8,
-        aq: bool,
-        rl: bool,
-    },
-    AmoswapW {
-        rd: u8,
-        rs1: u8,
-        rs2: u8,
-        aq: bool,
-        rl: bool,
-    },
-    LrW {
-        rd: u8,
-        rs1: u8,
-        aq: bool,
-        rl: bool,
-    },
-    ScW {
-        rd: u8,
-        rs1: u8,
-        rs2: u8,
-        aq: bool,
-        rl: bool,
-    },
-    LrD {
-        rd: u8,
-        rs1: u8,
-        aq: bool,
-        rl: bool,
-    },
-    ScD {
-        rd: u8,
-        rs1: u8,
-        rs2: u8,
-        aq: bool,
-        rl: bool,
-    },
-    Auipc {
-        rd: u8,
-        imm: i64,
-    },
-    Jal {
-        rd: u8,
-        imm: i64,
-    },
-    Jalr {
-        rd: u8,
-        rs1: u8,
-        imm: i64,
-    },
-    Beq {
-        rs1: u8,
-        rs2: u8,
-        imm: i64,
-    },
-    Bne {
-        rs1: u8,
-        rs2: u8,
-        imm: i64,
-    },
-    Blt {
-        rs1: u8,
-        rs2: u8,
-        imm: i64,
-    },
-    Bge {
-        rs1: u8,
-        rs2: u8,
-        imm: i64,
-    },
-    Bltu {
-        rs1: u8,
-        rs2: u8,
-        imm: i64,
-    },
-    Bgeu {
-        rs1: u8,
-        rs2: u8,
-        imm: i64,
-    },
-    Lb {
-        rd: u8,
-        rs1: u8,
-        imm: i64,
-    },
-    Lh {
-        rd: u8,
-        rs1: u8,
-        imm: i64,
-    },
-    Lw {
-        rd: u8,
-        rs1: u8,
-        imm: i64,
-    },
-    Ld {
-        rd: u8,
-        rs1: u8,
-        imm: i64,
-    },
-    Lbu {
-        rd: u8,
-        rs1: u8,
-        imm: i64,
-    },
-    Lhu {
-        rd: u8,
-        rs1: u8,
-        imm: i64,
-    },
-    Lwu {
-        rd: u8,
-        rs1: u8,
-        imm: i64,
-    },
-    Sb {
-        rs1: u8,
-        rs2: u8,
-        imm: i64,
-    },
-    Sh {
-        rs1: u8,
-        rs2: u8,
-        imm: i64,
-    },
-    Sw {
-        rs1: u8,
-        rs2: u8,
-        imm: i64,
-    },
-    Sd {
-        rs1: u8,
-        rs2: u8,
-        imm: i64,
-    },
-    // Addi — handled manually (li/mv pseudo-instructions)
-    Addi {
-        rd: u8,
-        rs1: u8,
-        imm: i64,
-    },
-    Slti {
-        rd: u8,
-        rs1: u8,
-        imm: i64,
-    },
-    Sltiu {
-        rd: u8,
-        rs1: u8,
-        imm: i64,
-    },
-    Xori {
-        rd: u8,
-        rs1: u8,
-        imm: i64,
-    },
-    Ori {
-        rd: u8,
-        rs1: u8,
-        imm: i64,
-    },
-    Andi {
-        rd: u8,
-        rs1: u8,
-        imm: i64,
-    },
-    Slli {
-        rd: u8,
-        rs1: u8,
-        shamt: u8,
-    },
-    Srli {
-        rd: u8,
-        rs1: u8,
-        shamt: u8,
-    },
-    Srai {
-        rd: u8,
-        rs1: u8,
-        shamt: u8,
-    },
-    Add {
-        rd: u8,
-        rs1: u8,
-        rs2: u8,
-    },
-    Sub {
-        rd: u8,
-        rs1: u8,
-        rs2: u8,
-    },
-    Sll {
-        rd: u8,
-        rs1: u8,
-        rs2: u8,
-    },
-    Slt {
-        rd: u8,
-        rs1: u8,
-        rs2: u8,
-    },
-    Sltu {
-        rd: u8,
-        rs1: u8,
-        rs2: u8,
-    },
-    Xor {
-        rd: u8,
-        rs1: u8,
-        rs2: u8,
-    },
-    Srl {
-        rd: u8,
-        rs1: u8,
-        rs2: u8,
-    },
-    Sra {
-        rd: u8,
-        rs1: u8,
-        rs2: u8,
-    },
-    Or {
-        rd: u8,
-        rs1: u8,
-        rs2: u8,
-    },
-    And {
-        rd: u8,
-        rs1: u8,
-        rs2: u8,
-    },
-    // RV64I W-suffix (32-bit ops sign-extended)
-    Addiw {
-        rd: u8,
-        rs1: u8,
-        imm: i64,
-    },
-    Slliw {
-        rd: u8,
-        rs1: u8,
-        shamt: u8,
-    },
-    Srliw {
-        rd: u8,
-        rs1: u8,
-        shamt: u8,
-    },
-    Sraiw {
-        rd: u8,
-        rs1: u8,
-        shamt: u8,
-    },
-    Addw {
-        rd: u8,
-        rs1: u8,
-        rs2: u8,
-    },
-    Subw {
-        rd: u8,
-        rs1: u8,
-        rs2: u8,
-    },
-    Sllw {
-        rd: u8,
-        rs1: u8,
-        rs2: u8,
-    },
-    Srlw {
-        rd: u8,
-        rs1: u8,
-        rs2: u8,
-    },
-    Sraw {
-        rd: u8,
-        rs1: u8,
-        rs2: u8,
-    },
-    // RV64M
-    Mul {
-        rd: u8,
-        rs1: u8,
-        rs2: u8,
-    },
-    Mulh {
-        rd: u8,
-        rs1: u8,
-        rs2: u8,
-    },
-    Mulhsu {
-        rd: u8,
-        rs1: u8,
-        rs2: u8,
-    },
-    Mulhu {
-        rd: u8,
-        rs1: u8,
-        rs2: u8,
-    },
-    Div {
-        rd: u8,
-        rs1: u8,
-        rs2: u8,
-    },
-    Divu {
-        rd: u8,
-        rs1: u8,
-        rs2: u8,
-    },
-    Rem {
-        rd: u8,
-        rs1: u8,
-        rs2: u8,
-    },
-    Remu {
-        rd: u8,
-        rs1: u8,
-        rs2: u8,
-    },
-    Mulw {
-        rd: u8,
-        rs1: u8,
-        rs2: u8,
-    },
-    Divw {
-        rd: u8,
-        rs1: u8,
-        rs2: u8,
-    },
-    Divuw {
-        rd: u8,
-        rs1: u8,
-        rs2: u8,
-    },
-    Remw {
-        rd: u8,
-        rs1: u8,
-        rs2: u8,
-    },
-    Remuw {
-        rd: u8,
-        rs1: u8,
-        rs2: u8,
-    },
-    // System
+    // U / J / I control flow.
+    Lui { rd: u8, imm: i64 },
+    Auipc { rd: u8, imm: i64 },
+    Jal { rd: u8, imm: i64 },
+    Jalr { rd: u8, rs1: u8, imm: i64 },
+    // B-type; op selects the comparison.
+    Branch { op: BOp, rs1: u8, rs2: u8, imm: i64 },
+    // I-type loads / stores; op selects width + signedness.
+    Load { op: LOp, rd: u8, rs1: u8, imm: i64 },
+    Store { op: SOp, rs1: u8, rs2: u8, imm: i64 },
+    // I-type ALU; shifts reuse `imm` to carry their shamt (bits 12..17).
+    IAlu { op: IOp, rd: u8, rs1: u8, imm: i64 },
+    // R-type: RV64I, RV64W and RV64M share one carrier.
+    RR { op: ROp, rd: u8, rs1: u8, rs2: u8 },
+    // A extension.
+    Amo { op: AmoOp, rd: u8, rs1: u8, rs2: u8, aq: bool, rl: bool },
+    // Zicsr; `src` is rs1 for *rw/rs/rc, a zero-extended uimm for *i.
+    Csr { op: COp, rd: u8, src: u8, csr: u16 },
     Ecall,
     Ebreak,
     Fence,
-    Csrrw {
-        rd: u8,
-        rs1: u8,
-        csr: u16,
-    },
-    Csrrs {
-        rd: u8,
-        rs1: u8,
-        csr: u16,
-    },
-    Csrrc {
-        rd: u8,
-        rs1: u8,
-        csr: u16,
-    },
-    Csrrwi {
-        rd: u8,
-        uimm: u8,
-        csr: u16,
-    },
-    Csrrsi {
-        rd: u8,
-        uimm: u8,
-        csr: u16,
-    },
-    Csrrci {
-        rd: u8,
-        uimm: u8,
-        csr: u16,
-    },
-    // Mret / Sret
     Mret,
     Sret,
     Illegal(u32),
@@ -404,7 +133,7 @@ fn bit(x: u32, n: u32) -> u32 {
     (x >> n) & 1
 }
 
-// Sign-extend: takes a value and the position of its sign bit, extends to i64
+// Sign-extend a field from its sign-bit position up to i64.
 #[inline(always)]
 fn sign_ext(x: u32, bit_pos: u32) -> i64 {
     let shift = 63 - bit_pos;
@@ -412,7 +141,6 @@ fn sign_ext(x: u32, bit_pos: u32) -> i64 {
 }
 
 // IMMEDIATE DECODERS
-
 fn imm_i(raw: u32) -> i64 {
     sign_ext(bits(raw, 20, 31), 11)
 }
@@ -420,317 +148,261 @@ fn imm_s(raw: u32) -> i64 {
     sign_ext((bits(raw, 25, 31) << 5) | bits(raw, 7, 11), 11)
 }
 fn imm_b(raw: u32) -> i64 {
-    let imm = (bit(raw, 31) << 12)
-        | (bit(raw, 7) << 11)
-        | (bits(raw, 25, 30) << 5)
-        | (bits(raw, 8, 11) << 1);
-    sign_ext(imm, 12)
+    sign_ext(
+        (bit(raw, 31) << 12) | (bit(raw, 7) << 11) | (bits(raw, 25, 30) << 5) | (bits(raw, 8, 11) << 1),
+        12,
+    )
 }
 fn imm_u(raw: u32) -> i64 {
     sign_ext(raw & 0xFFFF_F000, 31)
 }
 fn imm_j(raw: u32) -> i64 {
-    let imm = (bit(raw, 31) << 20)
-        | (bits(raw, 12, 19) << 12)
-        | (bit(raw, 20) << 11)
-        | (bits(raw, 21, 30) << 1);
-    sign_ext(imm, 20)
+    sign_ext(
+        (bit(raw, 31) << 20) | (bits(raw, 12, 19) << 12) | (bit(raw, 20) << 11) | (bits(raw, 21, 30) << 1),
+        20,
+    )
 }
 
-// DECODER: takes a raw 32-bit instruction word and returns a decoded Inst enum variant.
-pub fn decode(raw: u32) -> Inst {
-    let opcode = raw & 0x7F;
-    let rd = bits(raw, 7, 11) as u8;
-    let rs1 = bits(raw, 15, 19) as u8;
-    let rs2 = bits(raw, 20, 24) as u8;
-    let funct3 = bits(raw, 12, 14);
-    let funct7 = bits(raw, 25, 31);
-    let csr = bits(raw, 20, 31) as u16;
+// Shift-amount fields (SLLI is 6 bits, *W variants 5).
+#[inline(always)]
+fn shamt6(raw: u32) -> i64 {
+    ((raw >> 20) & 0x3F) as i64
+}
+#[inline(always)]
+fn shamt5(raw: u32) -> i64 {
+    ((raw >> 20) & 0x1F) as i64
+}
 
-    match opcode {
-        0x37 => Inst::Lui {
-            rd,
-            imm: imm_u(raw),
-        },
-        0x17 => Inst::Auipc {
-            rd,
-            imm: imm_u(raw),
-        },
-        0x6F => Inst::Jal {
-            rd,
-            imm: imm_j(raw),
-        },
-        0x67 => Inst::Jalr {
-            rd,
-            rs1,
-            imm: imm_i(raw),
-        },
-
-        0x63 => match funct3 {
-            0x0 => Inst::Beq {
-                rs1,
-                rs2,
-                imm: imm_b(raw),
-            },
-            0x1 => Inst::Bne {
-                rs1,
-                rs2,
-                imm: imm_b(raw),
-            },
-            0x4 => Inst::Blt {
-                rs1,
-                rs2,
-                imm: imm_b(raw),
-            },
-            0x5 => Inst::Bge {
-                rs1,
-                rs2,
-                imm: imm_b(raw),
-            },
-            0x6 => Inst::Bltu {
-                rs1,
-                rs2,
-                imm: imm_b(raw),
-            },
-            0x7 => Inst::Bgeu {
-                rs1,
-                rs2,
-                imm: imm_b(raw),
-            },
-            _ => Inst::Illegal(raw),
-        },
-
-        0x03 => match funct3 {
-            0x0 => Inst::Lb {
-                rd,
-                rs1,
-                imm: imm_i(raw),
-            },
-            0x1 => Inst::Lh {
-                rd,
-                rs1,
-                imm: imm_i(raw),
-            },
-            0x2 => Inst::Lw {
-                rd,
-                rs1,
-                imm: imm_i(raw),
-            },
-            0x3 => Inst::Ld {
-                rd,
-                rs1,
-                imm: imm_i(raw),
-            },
-            0x4 => Inst::Lbu {
-                rd,
-                rs1,
-                imm: imm_i(raw),
-            },
-            0x5 => Inst::Lhu {
-                rd,
-                rs1,
-                imm: imm_i(raw),
-            },
-            0x6 => Inst::Lwu {
-                rd,
-                rs1,
-                imm: imm_i(raw),
-            },
-            _ => Inst::Illegal(raw),
-        },
-
-        0x23 => match funct3 {
-            0x0 => Inst::Sb {
-                rs1,
-                rs2,
-                imm: imm_s(raw),
-            },
-            0x1 => Inst::Sh {
-                rs1,
-                rs2,
-                imm: imm_s(raw),
-            },
-            0x2 => Inst::Sw {
-                rs1,
-                rs2,
-                imm: imm_s(raw),
-            },
-            0x3 => Inst::Sd {
-                rs1,
-                rs2,
-                imm: imm_s(raw),
-            },
-            _ => Inst::Illegal(raw),
-        },
-
-        0x13 => {
-            let shamt = bits(raw, 20, 25) as u8;
-            match funct3 {
-                0x0 => Inst::Addi {
-                    rd,
-                    rs1,
-                    imm: imm_i(raw),
-                },
-                0x2 => Inst::Slti {
-                    rd,
-                    rs1,
-                    imm: imm_i(raw),
-                },
-                0x3 => Inst::Sltiu {
-                    rd,
-                    rs1,
-                    imm: imm_i(raw),
-                },
-                0x4 => Inst::Xori {
-                    rd,
-                    rs1,
-                    imm: imm_i(raw),
-                },
-                0x6 => Inst::Ori {
-                    rd,
-                    rs1,
-                    imm: imm_i(raw),
-                },
-                0x7 => Inst::Andi {
-                    rd,
-                    rs1,
-                    imm: imm_i(raw),
-                },
-                0x1 => Inst::Slli { rd, rs1, shamt },
-                0x5 => {
-                    if funct7 >> 1 == 0x10 {
-                        Inst::Srai { rd, rs1, shamt }
-                    } else {
-                        Inst::Srli { rd, rs1, shamt }
-                    }
-                }
-                _ => Inst::Illegal(raw),
-            }
+// DECODER — computed goto behind a function-pointer table.
+pub struct BitField<const LO: u32, const HI: u32>;
+impl<const LO: u32, const HI: u32> BitField<LO, HI> {
+    #[inline(always)]
+    pub fn get(word: u32) -> u32 {
+        (word & Self::mask()) >> LO
+    }
+    #[inline(always)]
+    const fn mask() -> u32 {
+        let n = HI - LO + 1;
+        if n == 32 {
+            u32::MAX
+        } else {
+            ((1u32 << n) - 1) << LO
         }
+    }
+}
 
-        0x33 => match (funct7, funct3) {
-            (0x00, 0x0) => Inst::Add { rd, rs1, rs2 },
-            (0x20, 0x0) => Inst::Sub { rd, rs1, rs2 },
-            (0x00, 0x1) => Inst::Sll { rd, rs1, rs2 },
-            (0x00, 0x2) => Inst::Slt { rd, rs1, rs2 },
-            (0x00, 0x3) => Inst::Sltu { rd, rs1, rs2 },
-            (0x00, 0x4) => Inst::Xor { rd, rs1, rs2 },
-            (0x00, 0x5) => Inst::Srl { rd, rs1, rs2 },
-            (0x20, 0x5) => Inst::Sra { rd, rs1, rs2 },
-            (0x00, 0x6) => Inst::Or { rd, rs1, rs2 },
-            (0x00, 0x7) => Inst::And { rd, rs1, rs2 },
-            (0x01, 0x0) => Inst::Mul { rd, rs1, rs2 },
-            (0x01, 0x1) => Inst::Mulh { rd, rs1, rs2 },
-            (0x01, 0x2) => Inst::Mulhsu { rd, rs1, rs2 },
-            (0x01, 0x3) => Inst::Mulhu { rd, rs1, rs2 },
-            (0x01, 0x4) => Inst::Div { rd, rs1, rs2 },
-            (0x01, 0x5) => Inst::Divu { rd, rs1, rs2 },
-            (0x01, 0x6) => Inst::Rem { rd, rs1, rs2 },
-            (0x01, 0x7) => Inst::Remu { rd, rs1, rs2 },
+type Rd = BitField<7, 11>;
+type Rs1 = BitField<15, 19>;
+type Rs2 = BitField<20, 24>;
+type Funct3 = BitField<12, 14>;
+type Funct7 = BitField<25, 31>;
+type CsrBits = BitField<20, 31>;
+
+fn decode_lui(raw: u32) -> Inst {
+    Inst::Lui { rd: Rd::get(raw) as u8, imm: imm_u(raw) }
+}
+fn decode_auipc(raw: u32) -> Inst {
+    Inst::Auipc { rd: Rd::get(raw) as u8, imm: imm_u(raw) }
+}
+fn decode_jal(raw: u32) -> Inst {
+    Inst::Jal { rd: Rd::get(raw) as u8, imm: imm_j(raw) }
+}
+fn decode_jalr(raw: u32) -> Inst {
+    Inst::Jalr { rd: Rd::get(raw) as u8, rs1: Rs1::get(raw) as u8, imm: imm_i(raw) }
+}
+fn decode_branch(raw: u32) -> Inst {
+    let op = match Funct3::get(raw) {
+        0 => BOp::Beq,
+        1 => BOp::Bne,
+        4 => BOp::Blt,
+        5 => BOp::Bge,
+        6 => BOp::Bltu,
+        7 => BOp::Bgeu,
+        _ => return Inst::Illegal(raw),
+    };
+    Inst::Branch { op, rs1: Rs1::get(raw) as u8, rs2: Rs2::get(raw) as u8, imm: imm_b(raw) }
+}
+fn decode_load(raw: u32) -> Inst {
+    let op = match Funct3::get(raw) {
+        0 => LOp::Lb,
+        1 => LOp::Lh,
+        2 => LOp::Lw,
+        3 => LOp::Ld,
+        4 => LOp::Lbu,
+        5 => LOp::Lhu,
+        6 => LOp::Lwu,
+        _ => return Inst::Illegal(raw),
+    };
+    Inst::Load { op, rd: Rd::get(raw) as u8, rs1: Rs1::get(raw) as u8, imm: imm_i(raw) }
+}
+fn decode_store(raw: u32) -> Inst {
+    let op = match Funct3::get(raw) {
+        0 => SOp::Sb,
+        1 => SOp::Sh,
+        2 => SOp::Sw,
+        3 => SOp::Sd,
+        _ => return Inst::Illegal(raw),
+    };
+    Inst::Store { op, rs1: Rs1::get(raw) as u8, rs2: Rs2::get(raw) as u8, imm: imm_s(raw) }
+}
+fn decode_op_imm(raw: u32) -> Inst {
+    let rd = Rd::get(raw) as u8;
+    let rs1 = Rs1::get(raw) as u8;
+    let imm = imm_i(raw);
+    match Funct3::get(raw) {
+        0 => Inst::IAlu { op: IOp::Addi, rd, rs1, imm },
+        2 => Inst::IAlu { op: IOp::Slti, rd, rs1, imm },
+        3 => Inst::IAlu { op: IOp::Sltiu, rd, rs1, imm },
+        4 => Inst::IAlu { op: IOp::Xori, rd, rs1, imm },
+        6 => Inst::IAlu { op: IOp::Ori, rd, rs1, imm },
+        7 => Inst::IAlu { op: IOp::Andi, rd, rs1, imm },
+        1 if Funct7::get(raw) == 0 => Inst::IAlu { op: IOp::Slli, rd, rs1, imm: shamt6(raw) },
+        5 => match Funct7::get(raw) {
+            0 => Inst::IAlu { op: IOp::Srli, rd, rs1, imm: shamt6(raw) },
+            0x20 => Inst::IAlu { op: IOp::Srai, rd, rs1, imm: shamt6(raw) },
             _ => Inst::Illegal(raw),
         },
-
-        0x1B => {
-            let shamt = bits(raw, 20, 24) as u8;
-            match funct3 {
-                0x0 => Inst::Addiw {
-                    rd,
-                    rs1,
-                    imm: imm_i(raw),
-                },
-                0x1 => Inst::Slliw { rd, rs1, shamt },
-                0x5 => {
-                    if funct7 == 0x20 {
-                        Inst::Sraiw { rd, rs1, shamt }
-                    } else {
-                        Inst::Srliw { rd, rs1, shamt }
-                    }
-                }
-                _ => Inst::Illegal(raw),
-            }
-        }
-
-        0x3B => match (funct7, funct3) {
-            (0x00, 0x0) => Inst::Addw { rd, rs1, rs2 },
-            (0x20, 0x0) => Inst::Subw { rd, rs1, rs2 },
-            (0x00, 0x1) => Inst::Sllw { rd, rs1, rs2 },
-            (0x00, 0x5) => Inst::Srlw { rd, rs1, rs2 },
-            (0x20, 0x5) => Inst::Sraw { rd, rs1, rs2 },
-            (0x01, 0x0) => Inst::Mulw { rd, rs1, rs2 },
-            (0x01, 0x4) => Inst::Divw { rd, rs1, rs2 },
-            (0x01, 0x5) => Inst::Divuw { rd, rs1, rs2 },
-            (0x01, 0x6) => Inst::Remw { rd, rs1, rs2 },
-            (0x01, 0x7) => Inst::Remuw { rd, rs1, rs2 },
-            _ => Inst::Illegal(raw),
-        },
-
-        0x2F => {
-            let funct5 = bits(raw, 27, 31);
-            let aq = bit(raw, 26) != 0;
-            let rl = bit(raw, 25) != 0;
-            match (funct5, funct3) {
-                (0x00, 0x2) => Inst::AmoaddW {
-                    rd,
-                    rs1,
-                    rs2,
-                    aq,
-                    rl,
-                },
-                (0x01, 0x2) => Inst::AmoswapW {
-                    rd,
-                    rs1,
-                    rs2,
-                    aq,
-                    rl,
-                },
-                (0x02, 0x2) => Inst::LrW { rd, rs1, aq, rl },
-                (0x03, 0x2) => Inst::ScW {
-                    rd,
-                    rs1,
-                    rs2,
-                    aq,
-                    rl,
-                },
-                (0x02, 0x3) => Inst::LrD { rd, rs1, aq, rl },
-                (0x03, 0x3) => Inst::ScD {
-                    rd,
-                    rs1,
-                    rs2,
-                    aq,
-                    rl,
-                },
-                _ => Inst::Illegal(raw),
-            }
-        }
-
-        0x73 => match funct3 {
-            0x0 => match raw {
-                0x0000_0073 => Inst::Ecall,
-                0x0010_0073 => Inst::Ebreak,
-                0x1020_0073 => Inst::Sret,
-                0x1050_0073 => Inst::Fence,
-                0x3020_0073 => Inst::Mret,
-                _ if raw & 0xFE007FFF == 0x12000073 => Inst::Fence,
-                _ => Inst::Illegal(raw),
-            },
-            0x1 => Inst::Csrrw { rd, rs1, csr },
-            0x2 => Inst::Csrrs { rd, rs1, csr },
-            0x3 => Inst::Csrrc { rd, rs1, csr },
-            0x5 => Inst::Csrrwi { rd, uimm: rs1, csr },
-            0x6 => Inst::Csrrsi { rd, uimm: rs1, csr },
-            0x7 => Inst::Csrrci { rd, uimm: rs1, csr },
-            _ => Inst::Illegal(raw),
-        },
-
-        0x0F => Inst::Fence,
         _ => Inst::Illegal(raw),
     }
+}
+fn decode_op_imm32(raw: u32) -> Inst {
+    let rd = Rd::get(raw) as u8;
+    let rs1 = Rs1::get(raw) as u8;
+    match Funct3::get(raw) {
+        0 => Inst::IAlu { op: IOp::Addiw, rd, rs1, imm: imm_i(raw) },
+        1 => Inst::IAlu { op: IOp::Slliw, rd, rs1, imm: shamt5(raw) },
+        5 => match Funct7::get(raw) {
+            0 => Inst::IAlu { op: IOp::Srliw, rd, rs1, imm: shamt5(raw) },
+            0x20 => Inst::IAlu { op: IOp::Sraiw, rd, rs1, imm: shamt5(raw) },
+            _ => Inst::Illegal(raw),
+        },
+        _ => Inst::Illegal(raw),
+    }
+}
+fn decode_op(raw: u32) -> Inst {
+    let rd = Rd::get(raw) as u8;
+    let rs1 = Rs1::get(raw) as u8;
+    let rs2 = Rs2::get(raw) as u8;
+    let op = match (Funct7::get(raw), Funct3::get(raw)) {
+        (0x00, 0) => ROp::Add,
+        (0x20, 0) => ROp::Sub,
+        (0x00, 1) => ROp::Sll,
+        (0x00, 2) => ROp::Slt,
+        (0x00, 3) => ROp::Sltu,
+        (0x00, 4) => ROp::Xor,
+        (0x00, 5) => ROp::Srl,
+        (0x20, 5) => ROp::Sra,
+        (0x00, 6) => ROp::Or,
+        (0x00, 7) => ROp::And,
+        (0x01, 0) => ROp::Mul,
+        (0x01, 1) => ROp::Mulh,
+        (0x01, 2) => ROp::Mulhsu,
+        (0x01, 3) => ROp::Mulhu,
+        (0x01, 4) => ROp::Div,
+        (0x01, 5) => ROp::Divu,
+        (0x01, 6) => ROp::Rem,
+        (0x01, 7) => ROp::Remu,
+        _ => return Inst::Illegal(raw),
+    };
+    Inst::RR { op, rd, rs1, rs2 }
+}
+fn decode_op32(raw: u32) -> Inst {
+    let rd = Rd::get(raw) as u8;
+    let rs1 = Rs1::get(raw) as u8;
+    let rs2 = Rs2::get(raw) as u8;
+    let op = match (Funct7::get(raw), Funct3::get(raw)) {
+        (0x00, 0) => ROp::Addw,
+        (0x20, 0) => ROp::Subw,
+        (0x00, 1) => ROp::Sllw,
+        (0x00, 5) => ROp::Srlw,
+        (0x20, 5) => ROp::Sraw,
+        (0x01, 0) => ROp::Mulw,
+        (0x01, 4) => ROp::Divw,
+        (0x01, 5) => ROp::Divuw,
+        (0x01, 6) => ROp::Remw,
+        (0x01, 7) => ROp::Remuw,
+        _ => return Inst::Illegal(raw),
+    };
+    Inst::RR { op, rd, rs1, rs2 }
+}
+fn decode_amo(raw: u32) -> Inst {
+    let op = match (raw >> 27, Funct3::get(raw)) {
+        (0b00000, 2) => AmoOp::AmoaddW,
+        (0b00001, 2) => AmoOp::AmoswapW,
+        (0b00010, 2) => AmoOp::LrW,
+        (0b00011, 2) => AmoOp::ScW,
+        (0b00010, 3) => AmoOp::LrD,
+        (0b00011, 3) => AmoOp::ScD,
+        _ => return Inst::Illegal(raw),
+    };
+    Inst::Amo {
+        op,
+        rd: Rd::get(raw) as u8,
+        rs1: Rs1::get(raw) as u8,
+        rs2: Rs2::get(raw) as u8,
+        aq: raw & (1 << 26) != 0,
+        rl: raw & (1 << 25) != 0,
+    }
+}
+fn decode_system(raw: u32) -> Inst {
+    match raw {
+        0x00000073 => return Inst::Ecall,
+        0x00100073 => return Inst::Ebreak,
+        0x30200073 => return Inst::Mret,
+        0x10200073 => return Inst::Sret,
+        _ => {}
+    }
+    let op = match Funct3::get(raw) {
+        1 => COp::Csrrw,
+        2 => COp::Csrrs,
+        3 => COp::Csrrc,
+        5 => COp::Csrrwi,
+        6 => COp::Csrrsi,
+        7 => COp::Csrrci,
+        _ => return Inst::Fence, // wfi / sfence.vma / fence.i
+    };
+    Inst::Csr { op, rd: Rd::get(raw) as u8, src: Rs1::get(raw) as u8, csr: CsrBits::get(raw) as u16 }
+}
+fn decode_fence(_raw: u32) -> Inst {
+    Inst::Fence
+}
+fn decode_illegal(raw: u32) -> Inst {
+    Inst::Illegal(raw)
+}
+
+type Decoder = fn(u32) -> Inst;
+
+const OP_TABLE: [Decoder; 128] = build_op_table();
+
+const fn build_op_table() -> [Decoder; 128] {
+    let mut t = [decode_illegal as Decoder; 128];
+    t[0x37] = decode_lui;
+    t[0x17] = decode_auipc;
+    t[0x6F] = decode_jal;
+    t[0x67] = decode_jalr;
+    t[0x63] = decode_branch;
+    t[0x03] = decode_load;
+    t[0x23] = decode_store;
+    t[0x13] = decode_op_imm;
+    t[0x33] = decode_op;
+    t[0x1B] = decode_op_imm32;
+    t[0x3B] = decode_op32;
+    t[0x2F] = decode_amo;
+    t[0x73] = decode_system;
+    t[0x0F] = decode_fence;
+    t
+}
+
+#[inline(always)]
+pub fn decode(raw: u32) -> Inst {
+    OP_TABLE[(raw & 0x7F) as usize](raw)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // Test-only instruction encoders for each format.
     fn r(funct7: u32, rs2: u32, rs1: u32, funct3: u32, rd: u32) -> u32 {
         (funct7 << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | 0x33
     }
@@ -744,987 +416,202 @@ mod tests {
         (imm << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | 0x1B
     }
     fn s(imm: u32, rs2: u32, rs1: u32, funct3: u32) -> u32 {
-        let imm_hi = (imm >> 5) & 0x7F;
-        let imm_lo = imm & 0x1F;
-        (imm_hi << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (imm_lo << 7) | 0x23
+        ((imm >> 5 & 0x7F) << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12)
+            | ((imm & 0x1F) << 7) | 0x23
     }
     fn b(imm: u32, rs2: u32, rs1: u32, funct3: u32) -> u32 {
-        let bit12 = (imm >> 12) & 1;
-        let bit11 = (imm >> 11) & 1;
-        let bits_10_5 = (imm >> 5) & 0x3F;
-        let bits_4_1 = (imm >> 1) & 0xF;
-        (bit12 << 31)
-            | (bits_10_5 << 25)
-            | (rs2 << 20)
-            | (rs1 << 15)
-            | (funct3 << 12)
-            | (bits_4_1 << 8)
-            | (bit11 << 7)
-            | 0x63
+        ((imm >> 12 & 1) << 31) | ((imm >> 5 & 0x3F) << 25) | (rs2 << 20) | (rs1 << 15)
+            | (funct3 << 12) | ((imm >> 1 & 0xF) << 8) | ((imm >> 11 & 1) << 7) | 0x63
     }
     fn u(imm: u32, rd: u32, opcode: u32) -> u32 {
         imm & 0xFFFFF000 | (rd << 7) | opcode
     }
     fn j(imm: u32, rd: u32) -> u32 {
-        let bit20 = (imm >> 20) & 1;
-        let bits_10_1 = (imm >> 1) & 0x3FF;
-        let bit11 = (imm >> 11) & 1;
-        let bits_19_12 = (imm >> 12) & 0xFF;
-        (bit20 << 31) | (bits_10_1 << 21) | (bit11 << 20) | (bits_19_12 << 12) | (rd << 7) | 0x6F
+        ((imm >> 20 & 1) << 31) | ((imm >> 1 & 0x3FF) << 21) | ((imm >> 11 & 1) << 20)
+            | ((imm >> 12 & 0xFF) << 12) | (rd << 7) | 0x6F
     }
-    // ---- RV64I R-type ----
-    #[test]
-    fn test_add() {
-        assert_eq!(
-            decode(r(0x00, 3, 2, 0, 1)),
-            Inst::Add {
-                rd: 1,
-                rs1: 2,
-                rs2: 3
-            }
-        );
-    }
-    #[test]
-    fn test_sub() {
-        assert_eq!(
-            decode(r(0x20, 3, 2, 0, 1)),
-            Inst::Sub {
-                rd: 1,
-                rs1: 2,
-                rs2: 3
-            }
-        );
-    }
-    #[test]
-    fn test_sll() {
-        assert_eq!(
-            decode(r(0x00, 3, 2, 1, 1)),
-            Inst::Sll {
-                rd: 1,
-                rs1: 2,
-                rs2: 3
-            }
-        );
-    }
-    #[test]
-    fn test_slt() {
-        assert_eq!(
-            decode(r(0x00, 3, 2, 2, 1)),
-            Inst::Slt {
-                rd: 1,
-                rs1: 2,
-                rs2: 3
-            }
-        );
-    }
-    #[test]
-    fn test_sltu() {
-        assert_eq!(
-            decode(r(0x00, 3, 2, 3, 1)),
-            Inst::Sltu {
-                rd: 1,
-                rs1: 2,
-                rs2: 3
-            }
-        );
-    }
-    #[test]
-    fn test_xor() {
-        assert_eq!(
-            decode(r(0x00, 3, 2, 4, 1)),
-            Inst::Xor {
-                rd: 1,
-                rs1: 2,
-                rs2: 3
-            }
-        );
-    }
-    #[test]
-    fn test_srl() {
-        assert_eq!(
-            decode(r(0x00, 3, 2, 5, 1)),
-            Inst::Srl {
-                rd: 1,
-                rs1: 2,
-                rs2: 3
-            }
-        );
-    }
-    #[test]
-    fn test_sra() {
-        assert_eq!(
-            decode(r(0x20, 3, 2, 5, 1)),
-            Inst::Sra {
-                rd: 1,
-                rs1: 2,
-                rs2: 3
-            }
-        );
-    }
-    #[test]
-    fn test_or() {
-        assert_eq!(
-            decode(r(0x00, 3, 2, 6, 1)),
-            Inst::Or {
-                rd: 1,
-                rs1: 2,
-                rs2: 3
-            }
-        );
-    }
-    #[test]
-    fn test_and() {
-        assert_eq!(
-            decode(r(0x00, 3, 2, 7, 1)),
-            Inst::And {
-                rd: 1,
-                rs1: 2,
-                rs2: 3
-            }
-        );
-    }
-
-    // ---- RV64M R-type ----
-    #[test]
-    fn test_mul() {
-        assert_eq!(
-            decode(r(0x01, 3, 2, 0, 1)),
-            Inst::Mul {
-                rd: 1,
-                rs1: 2,
-                rs2: 3
-            }
-        );
-    }
-    #[test]
-    fn test_mulh() {
-        assert_eq!(
-            decode(r(0x01, 3, 2, 1, 1)),
-            Inst::Mulh {
-                rd: 1,
-                rs1: 2,
-                rs2: 3
-            }
-        );
-    }
-    #[test]
-    fn test_mulhsu() {
-        assert_eq!(
-            decode(r(0x01, 3, 2, 2, 1)),
-            Inst::Mulhsu {
-                rd: 1,
-                rs1: 2,
-                rs2: 3
-            }
-        );
-    }
-    #[test]
-    fn test_mulhu() {
-        assert_eq!(
-            decode(r(0x01, 3, 2, 3, 1)),
-            Inst::Mulhu {
-                rd: 1,
-                rs1: 2,
-                rs2: 3
-            }
-        );
-    }
-    #[test]
-    fn test_div() {
-        assert_eq!(
-            decode(r(0x01, 3, 2, 4, 1)),
-            Inst::Div {
-                rd: 1,
-                rs1: 2,
-                rs2: 3
-            }
-        );
-    }
-    #[test]
-    fn test_divu() {
-        assert_eq!(
-            decode(r(0x01, 3, 2, 5, 1)),
-            Inst::Divu {
-                rd: 1,
-                rs1: 2,
-                rs2: 3
-            }
-        );
-    }
-    #[test]
-    fn test_rem() {
-        assert_eq!(
-            decode(r(0x01, 3, 2, 6, 1)),
-            Inst::Rem {
-                rd: 1,
-                rs1: 2,
-                rs2: 3
-            }
-        );
-    }
-    #[test]
-    fn test_remu() {
-        assert_eq!(
-            decode(r(0x01, 3, 2, 7, 1)),
-            Inst::Remu {
-                rd: 1,
-                rs1: 2,
-                rs2: 3
-            }
-        );
-    }
-
-    // ---- RV64I I-type (ALU immediate) ----
-    #[test]
-    fn test_addi() {
-        assert_eq!(
-            decode(i(0xFFF, 2, 0, 1, 0x13)),
-            Inst::Addi {
-                rd: 1,
-                rs1: 2,
-                imm: -1
-            }
-        );
-    }
-    #[test]
-    fn test_addi_zero() {
-        assert_eq!(
-            decode(i(0, 0, 0, 0, 0x13)),
-            Inst::Addi {
-                rd: 0,
-                rs1: 0,
-                imm: 0
-            }
-        );
-    }
-    #[test]
-    fn test_slti() {
-        assert_eq!(
-            decode(i(10, 2, 2, 1, 0x13)),
-            Inst::Slti {
-                rd: 1,
-                rs1: 2,
-                imm: 10
-            }
-        );
-    }
-    #[test]
-    fn test_sltiu() {
-        assert_eq!(
-            decode(i(10, 2, 3, 1, 0x13)),
-            Inst::Sltiu {
-                rd: 1,
-                rs1: 2,
-                imm: 10
-            }
-        );
-    }
-    #[test]
-    fn test_xori() {
-        assert_eq!(
-            decode(i(0xFF, 2, 4, 1, 0x13)),
-            Inst::Xori {
-                rd: 1,
-                rs1: 2,
-                imm: 0xFF
-            }
-        );
-    }
-    #[test]
-    fn test_ori() {
-        assert_eq!(
-            decode(i(0xFF, 2, 6, 1, 0x13)),
-            Inst::Ori {
-                rd: 1,
-                rs1: 2,
-                imm: 0xFF
-            }
-        );
-    }
-    #[test]
-    fn test_andi() {
-        assert_eq!(
-            decode(i(0xFF, 2, 7, 1, 0x13)),
-            Inst::Andi {
-                rd: 1,
-                rs1: 2,
-                imm: 0xFF
-            }
-        );
-    }
-
-    // ---- Shifts (I-type with funct3=1/5) ----
-    #[test]
-    fn test_slli() {
-        let raw = (5 << 20) | (2 << 15) | (1 << 12) | (1 << 7) | 0x13;
-        assert_eq!(
-            decode(raw),
-            Inst::Slli {
-                rd: 1,
-                rs1: 2,
-                shamt: 5
-            }
-        );
-    }
-    #[test]
-    fn test_srli() {
-        let raw = (5 << 20) | (2 << 15) | (5 << 12) | (1 << 7) | 0x13;
-        assert_eq!(
-            decode(raw),
-            Inst::Srli {
-                rd: 1,
-                rs1: 2,
-                shamt: 5
-            }
-        );
-    }
-    #[test]
-    fn test_srai() {
-        let raw = (0x10 << 26) | (5 << 20) | (2 << 15) | (5 << 12) | (1 << 7) | 0x13;
-        assert_eq!(
-            decode(raw),
-            Inst::Srai {
-                rd: 1,
-                rs1: 2,
-                shamt: 5
-            }
-        );
-    }
-
-    // ---- U-type ----
-    #[test]
-    fn test_lui() {
-        assert_eq!(
-            decode(u(0x12345000, 1, 0x37)),
-            Inst::Lui {
-                rd: 1,
-                imm: 0x12345000
-            }
-        );
-    }
-    #[test]
-    fn test_auipc() {
-        assert_eq!(
-            decode(u(0x12345000, 1, 0x17)),
-            Inst::Auipc {
-                rd: 1,
-                imm: 0x12345000
-            }
-        );
-    }
-
-    // ---- J-type ----
-    #[test]
-    fn test_jal() {
-        assert_eq!(decode(j(0x100, 1)), Inst::Jal { rd: 1, imm: 0x100 });
-    }
-    #[test]
-    fn test_jal_neg() {
-        assert_eq!(decode(j(0x1FFFFE, 1)), Inst::Jal { rd: 1, imm: -2 });
-    }
-
-    // ---- I-type (JALR) ----
-    #[test]
-    fn test_jalr() {
-        assert_eq!(
-            decode(i(0x100, 2, 0, 1, 0x67)),
-            Inst::Jalr {
-                rd: 1,
-                rs1: 2,
-                imm: 0x100
-            }
-        );
-    }
-
-    // ---- B-type ----
-    #[test]
-    fn test_beq() {
-        assert_eq!(
-            decode(b(8, 3, 2, 0)),
-            Inst::Beq {
-                rs1: 2,
-                rs2: 3,
-                imm: 8
-            }
-        );
-    }
-    #[test]
-    fn test_bne() {
-        assert_eq!(
-            decode(b(8, 3, 2, 1)),
-            Inst::Bne {
-                rs1: 2,
-                rs2: 3,
-                imm: 8
-            }
-        );
-    }
-    #[test]
-    fn test_blt() {
-        assert_eq!(
-            decode(b(8, 3, 2, 4)),
-            Inst::Blt {
-                rs1: 2,
-                rs2: 3,
-                imm: 8
-            }
-        );
-    }
-    #[test]
-    fn test_bge() {
-        assert_eq!(
-            decode(b(8, 3, 2, 5)),
-            Inst::Bge {
-                rs1: 2,
-                rs2: 3,
-                imm: 8
-            }
-        );
-    }
-    #[test]
-    fn test_bltu() {
-        assert_eq!(
-            decode(b(8, 3, 2, 6)),
-            Inst::Bltu {
-                rs1: 2,
-                rs2: 3,
-                imm: 8
-            }
-        );
-    }
-    #[test]
-    fn test_bgeu() {
-        assert_eq!(
-            decode(b(8, 3, 2, 7)),
-            Inst::Bgeu {
-                rs1: 2,
-                rs2: 3,
-                imm: 8
-            }
-        );
-    }
-
-    // ---- I-type (loads) ----
-    #[test]
-    fn test_lb() {
-        assert_eq!(
-            decode(i(0x100, 2, 0, 1, 0x03)),
-            Inst::Lb {
-                rd: 1,
-                rs1: 2,
-                imm: 0x100
-            }
-        );
-    }
-    #[test]
-    fn test_lh() {
-        assert_eq!(
-            decode(i(0x100, 2, 1, 1, 0x03)),
-            Inst::Lh {
-                rd: 1,
-                rs1: 2,
-                imm: 0x100
-            }
-        );
-    }
-    #[test]
-    fn test_lw() {
-        assert_eq!(
-            decode(i(0x100, 2, 2, 1, 0x03)),
-            Inst::Lw {
-                rd: 1,
-                rs1: 2,
-                imm: 0x100
-            }
-        );
-    }
-    #[test]
-    fn test_ld() {
-        assert_eq!(
-            decode(i(0x100, 2, 3, 1, 0x03)),
-            Inst::Ld {
-                rd: 1,
-                rs1: 2,
-                imm: 0x100
-            }
-        );
-    }
-    #[test]
-    fn test_lbu() {
-        assert_eq!(
-            decode(i(0x100, 2, 4, 1, 0x03)),
-            Inst::Lbu {
-                rd: 1,
-                rs1: 2,
-                imm: 0x100
-            }
-        );
-    }
-    #[test]
-    fn test_lhu() {
-        assert_eq!(
-            decode(i(0x100, 2, 5, 1, 0x03)),
-            Inst::Lhu {
-                rd: 1,
-                rs1: 2,
-                imm: 0x100
-            }
-        );
-    }
-    #[test]
-    fn test_lwu() {
-        assert_eq!(
-            decode(i(0x100, 2, 6, 1, 0x03)),
-            Inst::Lwu {
-                rd: 1,
-                rs1: 2,
-                imm: 0x100
-            }
-        );
-    }
-
-    // ---- S-type ----
-    #[test]
-    fn test_sb() {
-        assert_eq!(
-            decode(s(0x108, 3, 2, 0)),
-            Inst::Sb {
-                rs1: 2,
-                rs2: 3,
-                imm: 0x108
-            }
-        );
-    }
-    #[test]
-    fn test_sh() {
-        assert_eq!(
-            decode(s(0x108, 3, 2, 1)),
-            Inst::Sh {
-                rs1: 2,
-                rs2: 3,
-                imm: 0x108
-            }
-        );
-    }
-    #[test]
-    fn test_sw() {
-        assert_eq!(
-            decode(s(0x108, 3, 2, 2)),
-            Inst::Sw {
-                rs1: 2,
-                rs2: 3,
-                imm: 0x108
-            }
-        );
-    }
-    #[test]
-    fn test_sd() {
-        assert_eq!(
-            decode(s(0x108, 3, 2, 3)),
-            Inst::Sd {
-                rs1: 2,
-                rs2: 3,
-                imm: 0x108
-            }
-        );
-    }
-
-    // ---- System instructions ----
-    #[test]
-    fn test_ecall() {
-        assert_eq!(decode(0x00000073), Inst::Ecall);
-    }
-    #[test]
-    fn test_ebreak() {
-        assert_eq!(decode(0x00100073), Inst::Ebreak);
-    }
-    #[test]
-    fn test_mret() {
-        assert_eq!(decode(0x30200073), Inst::Mret);
-    }
-    #[test]
-    fn test_sret() {
-        assert_eq!(decode(0x10200073), Inst::Sret);
-    }
-    #[test]
-    fn test_wfi() {
-        assert_eq!(decode(0x10500073), Inst::Fence);
-    }
-    #[test]
-    fn test_fence() {
-        assert_eq!(decode(0x0FF0000F), Inst::Fence);
-    }
-    #[test]
-    fn test_sfence_vma() {
-        assert_eq!(decode(0x12000073), Inst::Fence);
-    }
-    #[test]
-    fn test_sfence_vma_rs1() {
-        assert_eq!(decode(0x12050073), Inst::Fence);
-    }
-
-    // ---- CSR instructions ----
-    #[test]
-    fn test_csrrw() {
-        assert_eq!(
-            decode(0x30051073),
-            Inst::Csrrw {
-                rd: 0,
-                rs1: 10,
-                csr: 0x300
-            }
-        );
-    }
-    #[test]
-    fn test_csrrs() {
-        assert_eq!(
-            decode(0x30052073),
-            Inst::Csrrs {
-                rd: 0,
-                rs1: 10,
-                csr: 0x300
-            }
-        );
-    }
-    #[test]
-    fn test_csrrc() {
-        assert_eq!(
-            decode(0x30053073),
-            Inst::Csrrc {
-                rd: 0,
-                rs1: 10,
-                csr: 0x300
-            }
-        );
-    }
-    #[test]
-    fn test_csrrwi() {
-        assert_eq!(
-            decode(0x30055073),
-            Inst::Csrrwi {
-                rd: 0,
-                uimm: 10,
-                csr: 0x300
-            }
-        );
-    }
-    #[test]
-    fn test_csrrsi() {
-        assert_eq!(
-            decode(0x30056073),
-            Inst::Csrrsi {
-                rd: 0,
-                uimm: 10,
-                csr: 0x300
-            }
-        );
-    }
-    #[test]
-    fn test_csrrci() {
-        assert_eq!(
-            decode(0x30057073),
-            Inst::Csrrci {
-                rd: 0,
-                uimm: 10,
-                csr: 0x300
-            }
-        );
-    }
-
-    // ---- 32-bit immediate ALU (RV64) ----
-    #[test]
-    fn test_addiw() {
-        assert_eq!(
-            decode(iw(0x100, 2, 0, 1)),
-            Inst::Addiw {
-                rd: 1,
-                rs1: 2,
-                imm: 0x100
-            }
-        );
-    }
-    #[test]
-    fn test_slliw() {
-        let raw = (5 << 20) | (2 << 15) | (1 << 12) | (1 << 7) | 0x1B;
-        assert_eq!(
-            decode(raw),
-            Inst::Slliw {
-                rd: 1,
-                rs1: 2,
-                shamt: 5
-            }
-        );
-    }
-    #[test]
-    fn test_srliw() {
-        let raw = (5 << 20) | (2 << 15) | (5 << 12) | (1 << 7) | 0x1B;
-        assert_eq!(
-            decode(raw),
-            Inst::Srliw {
-                rd: 1,
-                rs1: 2,
-                shamt: 5
-            }
-        );
-    }
-    #[test]
-    fn test_sraiw() {
-        let raw = (0x20 << 25) | (5 << 20) | (2 << 15) | (5 << 12) | (1 << 7) | 0x1B;
-        assert_eq!(
-            decode(raw),
-            Inst::Sraiw {
-                rd: 1,
-                rs1: 2,
-                shamt: 5
-            }
-        );
-    }
-
-    // ---- 32-bit register ALU (RV64) ----
-    #[test]
-    fn test_addw() {
-        assert_eq!(
-            decode(rw(0x00, 3, 2, 0, 1)),
-            Inst::Addw {
-                rd: 1,
-                rs1: 2,
-                rs2: 3
-            }
-        );
-    }
-    #[test]
-    fn test_subw() {
-        assert_eq!(
-            decode(rw(0x20, 3, 2, 0, 1)),
-            Inst::Subw {
-                rd: 1,
-                rs1: 2,
-                rs2: 3
-            }
-        );
-    }
-    #[test]
-    fn test_sllw() {
-        assert_eq!(
-            decode(rw(0x00, 3, 2, 1, 1)),
-            Inst::Sllw {
-                rd: 1,
-                rs1: 2,
-                rs2: 3
-            }
-        );
-    }
-    #[test]
-    fn test_srlw() {
-        assert_eq!(
-            decode(rw(0x00, 3, 2, 5, 1)),
-            Inst::Srlw {
-                rd: 1,
-                rs1: 2,
-                rs2: 3
-            }
-        );
-    }
-    #[test]
-    fn test_sraw() {
-        assert_eq!(
-            decode(rw(0x20, 3, 2, 5, 1)),
-            Inst::Sraw {
-                rd: 1,
-                rs1: 2,
-                rs2: 3
-            }
-        );
-    }
-    #[test]
-    fn test_mulw() {
-        assert_eq!(
-            decode(rw(0x01, 3, 2, 0, 1)),
-            Inst::Mulw {
-                rd: 1,
-                rs1: 2,
-                rs2: 3
-            }
-        );
-    }
-    #[test]
-    fn test_divw() {
-        assert_eq!(
-            decode(rw(0x01, 3, 2, 4, 1)),
-            Inst::Divw {
-                rd: 1,
-                rs1: 2,
-                rs2: 3
-            }
-        );
-    }
-    #[test]
-    fn test_divuw() {
-        assert_eq!(
-            decode(rw(0x01, 3, 2, 5, 1)),
-            Inst::Divuw {
-                rd: 1,
-                rs1: 2,
-                rs2: 3
-            }
-        );
-    }
-    #[test]
-    fn test_remw() {
-        assert_eq!(
-            decode(rw(0x01, 3, 2, 6, 1)),
-            Inst::Remw {
-                rd: 1,
-                rs1: 2,
-                rs2: 3
-            }
-        );
-    }
-    #[test]
-    fn test_remuw() {
-        assert_eq!(
-            decode(rw(0x01, 3, 2, 7, 1)),
-            Inst::Remuw {
-                rd: 1,
-                rs1: 2,
-                rs2: 3
-            }
-        );
-    }
-
-    // ---- Atomic instructions ----
     fn amos(imm: u32, rs2: u32, rs1: u32, funct3: u32, rd: u32) -> u32 {
         (imm << 27) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | 0x2F
     }
-    #[test]
-    fn test_amoaddw() {
-        assert_eq!(
-            decode(amos(0, 3, 2, 2, 1)),
-            Inst::AmoaddW {
-                rd: 1,
-                rs1: 2,
-                rs2: 3,
-                aq: false,
-                rl: false
-            }
-        );
-    }
-    #[test]
-    fn test_amoswapw() {
-        assert_eq!(
-            decode(amos(1, 3, 2, 2, 1)),
-            Inst::AmoswapW {
-                rd: 1,
-                rs1: 2,
-                rs2: 3,
-                aq: false,
-                rl: false
-            }
-        );
-    }
-    #[test]
-    fn test_lrw() {
-        assert_eq!(
-            decode(amos(2, 0, 2, 2, 1)),
-            Inst::LrW {
-                rd: 1,
-                rs1: 2,
-                aq: false,
-                rl: false
-            }
-        );
-    }
-    #[test]
-    fn test_scw() {
-        assert_eq!(
-            decode(amos(3, 3, 2, 2, 1)),
-            Inst::ScW {
-                rd: 1,
-                rs1: 2,
-                rs2: 3,
-                aq: false,
-                rl: false
-            }
-        );
-    }
-    #[test]
-    fn test_lrd() {
-        assert_eq!(
-            decode(amos(2, 0, 2, 3, 1)),
-            Inst::LrD {
-                rd: 1,
-                rs1: 2,
-                aq: false,
-                rl: false
-            }
-        );
-    }
-    #[test]
-    fn test_scd() {
-        assert_eq!(
-            decode(amos(3, 3, 2, 3, 1)),
-            Inst::ScD {
-                rd: 1,
-                rs1: 2,
-                rs2: 3,
-                aq: false,
-                rl: false
-            }
-        );
+
+    /// Assert every (encoded, expected) pair decodes exactly.
+    fn chk<const N: usize>(cases: [(u32, Inst); N]) {
+        for (raw, exp) in cases {
+            assert_eq!(decode(raw), exp);
+        }
     }
 
-    // ---- Illegal instructions ----
     #[test]
-    fn test_illegal_opcode() {
-        assert_eq!(decode(0xFFFFFFFF), Inst::Illegal(0xFFFFFFFF));
-    }
-    #[test]
-    fn test_illegal_load_funct3() {
-        let raw = i(0x100, 2, 7, 1, 0x03);
-        assert_eq!(decode(raw), Inst::Illegal(raw));
-    }
-    #[test]
-    fn test_illegal_store_funct3() {
-        let raw = s(0x108, 3, 2, 7);
-        assert_eq!(decode(raw), Inst::Illegal(raw));
-    }
-
-    // ---- Max register numbers ----
-    #[test]
-    fn test_max_regs() {
-        assert_eq!(
-            decode(r(0x00, 31, 31, 0, 31)),
-            Inst::Add {
-                rd: 31,
-                rs1: 31,
-                rs2: 31
-            }
-        );
+    fn rtype() {
+        chk([
+            (r(0x00, 3, 2, 0, 1), Inst::RR { op: ROp::Add, rd: 1, rs1: 2, rs2: 3 }),
+            (r(0x20, 3, 2, 0, 1), Inst::RR { op: ROp::Sub, rd: 1, rs1: 2, rs2: 3 }),
+            (r(0x00, 3, 2, 1, 1), Inst::RR { op: ROp::Sll, rd: 1, rs1: 2, rs2: 3 }),
+            (r(0x00, 3, 2, 2, 1), Inst::RR { op: ROp::Slt, rd: 1, rs1: 2, rs2: 3 }),
+            (r(0x00, 3, 2, 3, 1), Inst::RR { op: ROp::Sltu, rd: 1, rs1: 2, rs2: 3 }),
+            (r(0x00, 3, 2, 4, 1), Inst::RR { op: ROp::Xor, rd: 1, rs1: 2, rs2: 3 }),
+            (r(0x00, 3, 2, 5, 1), Inst::RR { op: ROp::Srl, rd: 1, rs1: 2, rs2: 3 }),
+            (r(0x20, 3, 2, 5, 1), Inst::RR { op: ROp::Sra, rd: 1, rs1: 2, rs2: 3 }),
+            (r(0x00, 3, 2, 6, 1), Inst::RR { op: ROp::Or, rd: 1, rs1: 2, rs2: 3 }),
+            (r(0x00, 3, 2, 7, 1), Inst::RR { op: ROp::And, rd: 1, rs1: 2, rs2: 3 }),
+            (r(0x00, 31, 31, 0, 31), Inst::RR { op: ROp::Add, rd: 31, rs1: 31, rs2: 31 }),
+        ]);
     }
 
-    // ---- Immediate sign extension ----
     #[test]
-    fn test_imm_sign_ext() {
-        let raw = i(0x800, 0, 0, 1, 0x13);
-        assert_eq!(
-            decode(raw),
-            Inst::Addi {
-                rd: 1,
-                rs1: 0,
-                imm: -2048
-            }
-        );
+    fn rtype_m() {
+        chk([
+            (r(0x01, 3, 2, 0, 1), Inst::RR { op: ROp::Mul, rd: 1, rs1: 2, rs2: 3 }),
+            (r(0x01, 3, 2, 1, 1), Inst::RR { op: ROp::Mulh, rd: 1, rs1: 2, rs2: 3 }),
+            (r(0x01, 3, 2, 2, 1), Inst::RR { op: ROp::Mulhsu, rd: 1, rs1: 2, rs2: 3 }),
+            (r(0x01, 3, 2, 3, 1), Inst::RR { op: ROp::Mulhu, rd: 1, rs1: 2, rs2: 3 }),
+            (r(0x01, 3, 2, 4, 1), Inst::RR { op: ROp::Div, rd: 1, rs1: 2, rs2: 3 }),
+            (r(0x01, 3, 2, 5, 1), Inst::RR { op: ROp::Divu, rd: 1, rs1: 2, rs2: 3 }),
+            (r(0x01, 3, 2, 6, 1), Inst::RR { op: ROp::Rem, rd: 1, rs1: 2, rs2: 3 }),
+            (r(0x01, 3, 2, 7, 1), Inst::RR { op: ROp::Remu, rd: 1, rs1: 2, rs2: 3 }),
+        ]);
     }
+
     #[test]
-    fn test_imm_pos() {
-        let raw = i(0x7FF, 0, 0, 1, 0x13);
-        assert_eq!(
-            decode(raw),
-            Inst::Addi {
-                rd: 1,
-                rs1: 0,
-                imm: 2047
-            }
-        );
+    fn op_imm() {
+        chk([
+            (i(0xFFF, 2, 0, 1, 0x13), Inst::IAlu { op: IOp::Addi, rd: 1, rs1: 2, imm: -1 }),
+            (i(0, 0, 0, 0, 0x13), Inst::IAlu { op: IOp::Addi, rd: 0, rs1: 0, imm: 0 }),
+            (i(0x800, 0, 0, 1, 0x13), Inst::IAlu { op: IOp::Addi, rd: 1, rs1: 0, imm: -2048 }),
+            (i(0x7FF, 0, 0, 1, 0x13), Inst::IAlu { op: IOp::Addi, rd: 1, rs1: 0, imm: 2047 }),
+            (i(10, 2, 2, 1, 0x13), Inst::IAlu { op: IOp::Slti, rd: 1, rs1: 2, imm: 10 }),
+            (i(10, 2, 3, 1, 0x13), Inst::IAlu { op: IOp::Sltiu, rd: 1, rs1: 2, imm: 10 }),
+            (i(0xFF, 2, 4, 1, 0x13), Inst::IAlu { op: IOp::Xori, rd: 1, rs1: 2, imm: 0xFF }),
+            (i(0xFF, 2, 6, 1, 0x13), Inst::IAlu { op: IOp::Ori, rd: 1, rs1: 2, imm: 0xFF }),
+            (i(0xFF, 2, 7, 1, 0x13), Inst::IAlu { op: IOp::Andi, rd: 1, rs1: 2, imm: 0xFF }),
+        ]);
+    }
+
+    #[test]
+    fn shifts() {
+        chk([
+            ((5 << 20) | (2 << 15) | (1 << 12) | (1 << 7) | 0x13, Inst::IAlu { op: IOp::Slli, rd: 1, rs1: 2, imm: 5 }),
+            ((5 << 20) | (2 << 15) | (5 << 12) | (1 << 7) | 0x13, Inst::IAlu { op: IOp::Srli, rd: 1, rs1: 2, imm: 5 }),
+            ((0x10 << 26) | (5 << 20) | (2 << 15) | (5 << 12) | (1 << 7) | 0x13, Inst::IAlu { op: IOp::Srai, rd: 1, rs1: 2, imm: 5 }),
+        ]);
+    }
+
+    #[test]
+    fn u_type() {
+        chk([
+            (u(0x12345000, 1, 0x37), Inst::Lui { rd: 1, imm: 0x12345000 }),
+            (u(0x12345000, 1, 0x17), Inst::Auipc { rd: 1, imm: 0x12345000 }),
+        ]);
+    }
+
+    #[test]
+    fn jumps() {
+        chk([
+            (j(0x100, 1), Inst::Jal { rd: 1, imm: 0x100 }),
+            (j(0x1FFFFE, 1), Inst::Jal { rd: 1, imm: -2 }),
+            (i(0x100, 2, 0, 1, 0x67), Inst::Jalr { rd: 1, rs1: 2, imm: 0x100 }),
+        ]);
+    }
+
+    #[test]
+    fn branches() {
+        chk([
+            (b(8, 3, 2, 0), Inst::Branch { op: BOp::Beq, rs1: 2, rs2: 3, imm: 8 }),
+            (b(8, 3, 2, 1), Inst::Branch { op: BOp::Bne, rs1: 2, rs2: 3, imm: 8 }),
+            (b(8, 3, 2, 4), Inst::Branch { op: BOp::Blt, rs1: 2, rs2: 3, imm: 8 }),
+            (b(8, 3, 2, 5), Inst::Branch { op: BOp::Bge, rs1: 2, rs2: 3, imm: 8 }),
+            (b(8, 3, 2, 6), Inst::Branch { op: BOp::Bltu, rs1: 2, rs2: 3, imm: 8 }),
+            (b(8, 3, 2, 7), Inst::Branch { op: BOp::Bgeu, rs1: 2, rs2: 3, imm: 8 }),
+        ]);
+    }
+
+    #[test]
+    fn loads() {
+        chk([
+            (i(0x100, 2, 0, 1, 0x03), Inst::Load { op: LOp::Lb, rd: 1, rs1: 2, imm: 0x100 }),
+            (i(0x100, 2, 1, 1, 0x03), Inst::Load { op: LOp::Lh, rd: 1, rs1: 2, imm: 0x100 }),
+            (i(0x100, 2, 2, 1, 0x03), Inst::Load { op: LOp::Lw, rd: 1, rs1: 2, imm: 0x100 }),
+            (i(0x100, 2, 3, 1, 0x03), Inst::Load { op: LOp::Ld, rd: 1, rs1: 2, imm: 0x100 }),
+            (i(0x100, 2, 4, 1, 0x03), Inst::Load { op: LOp::Lbu, rd: 1, rs1: 2, imm: 0x100 }),
+            (i(0x100, 2, 5, 1, 0x03), Inst::Load { op: LOp::Lhu, rd: 1, rs1: 2, imm: 0x100 }),
+            (i(0x100, 2, 6, 1, 0x03), Inst::Load { op: LOp::Lwu, rd: 1, rs1: 2, imm: 0x100 }),
+        ]);
+    }
+
+    #[test]
+    fn stores() {
+        chk([
+            (s(0x108, 3, 2, 0), Inst::Store { op: SOp::Sb, rs1: 2, rs2: 3, imm: 0x108 }),
+            (s(0x108, 3, 2, 1), Inst::Store { op: SOp::Sh, rs1: 2, rs2: 3, imm: 0x108 }),
+            (s(0x108, 3, 2, 2), Inst::Store { op: SOp::Sw, rs1: 2, rs2: 3, imm: 0x108 }),
+            (s(0x108, 3, 2, 3), Inst::Store { op: SOp::Sd, rs1: 2, rs2: 3, imm: 0x108 }),
+        ]);
+    }
+
+    #[test]
+    fn system() {
+        chk([
+            (0x00000073, Inst::Ecall),
+            (0x00100073, Inst::Ebreak),
+            (0x30200073, Inst::Mret),
+            (0x10200073, Inst::Sret),
+            (0x10500073, Inst::Fence), // wfi
+            (0x0FF0000F, Inst::Fence),
+            (0x12000073, Inst::Fence), // sfence.vma
+            (0x12050073, Inst::Fence),
+        ]);
+    }
+
+    #[test]
+    fn csr_ops() {
+        chk([
+            (0x30051073, Inst::Csr { op: COp::Csrrw, rd: 0, src: 10, csr: 0x300 }),
+            (0x30052073, Inst::Csr { op: COp::Csrrs, rd: 0, src: 10, csr: 0x300 }),
+            (0x30053073, Inst::Csr { op: COp::Csrrc, rd: 0, src: 10, csr: 0x300 }),
+            (0x30055073, Inst::Csr { op: COp::Csrrwi, rd: 0, src: 10, csr: 0x300 }),
+            (0x30056073, Inst::Csr { op: COp::Csrrsi, rd: 0, src: 10, csr: 0x300 }),
+            (0x30057073, Inst::Csr { op: COp::Csrrci, rd: 0, src: 10, csr: 0x300 }),
+        ]);
+    }
+
+    #[test]
+    fn word_alu() {
+        chk([
+            (iw(0x100, 2, 0, 1), Inst::IAlu { op: IOp::Addiw, rd: 1, rs1: 2, imm: 0x100 }),
+            ((5 << 20) | (2 << 15) | (1 << 12) | (1 << 7) | 0x1B, Inst::IAlu { op: IOp::Slliw, rd: 1, rs1: 2, imm: 5 }),
+            ((5 << 20) | (2 << 15) | (5 << 12) | (1 << 7) | 0x1B, Inst::IAlu { op: IOp::Srliw, rd: 1, rs1: 2, imm: 5 }),
+            ((0x20 << 25) | (5 << 20) | (2 << 15) | (5 << 12) | (1 << 7) | 0x1B, Inst::IAlu { op: IOp::Sraiw, rd: 1, rs1: 2, imm: 5 }),
+            (rw(0x00, 3, 2, 0, 1), Inst::RR { op: ROp::Addw, rd: 1, rs1: 2, rs2: 3 }),
+            (rw(0x20, 3, 2, 0, 1), Inst::RR { op: ROp::Subw, rd: 1, rs1: 2, rs2: 3 }),
+            (rw(0x00, 3, 2, 1, 1), Inst::RR { op: ROp::Sllw, rd: 1, rs1: 2, rs2: 3 }),
+            (rw(0x00, 3, 2, 5, 1), Inst::RR { op: ROp::Srlw, rd: 1, rs1: 2, rs2: 3 }),
+            (rw(0x20, 3, 2, 5, 1), Inst::RR { op: ROp::Sraw, rd: 1, rs1: 2, rs2: 3 }),
+            (rw(0x01, 3, 2, 0, 1), Inst::RR { op: ROp::Mulw, rd: 1, rs1: 2, rs2: 3 }),
+            (rw(0x01, 3, 2, 4, 1), Inst::RR { op: ROp::Divw, rd: 1, rs1: 2, rs2: 3 }),
+            (rw(0x01, 3, 2, 5, 1), Inst::RR { op: ROp::Divuw, rd: 1, rs1: 2, rs2: 3 }),
+            (rw(0x01, 3, 2, 6, 1), Inst::RR { op: ROp::Remw, rd: 1, rs1: 2, rs2: 3 }),
+            (rw(0x01, 3, 2, 7, 1), Inst::RR { op: ROp::Remuw, rd: 1, rs1: 2, rs2: 3 }),
+        ]);
+    }
+
+    #[test]
+    fn atomics() {
+        chk([
+            (amos(0, 3, 2, 2, 1), Inst::Amo { op: AmoOp::AmoaddW, rd: 1, rs1: 2, rs2: 3, aq: false, rl: false }),
+            (amos(1, 3, 2, 2, 1), Inst::Amo { op: AmoOp::AmoswapW, rd: 1, rs1: 2, rs2: 3, aq: false, rl: false }),
+            (amos(2, 0, 2, 2, 1), Inst::Amo { op: AmoOp::LrW, rd: 1, rs1: 2, rs2: 0, aq: false, rl: false }),
+            (amos(3, 3, 2, 2, 1), Inst::Amo { op: AmoOp::ScW, rd: 1, rs1: 2, rs2: 3, aq: false, rl: false }),
+            (amos(2, 0, 2, 3, 1), Inst::Amo { op: AmoOp::LrD, rd: 1, rs1: 2, rs2: 0, aq: false, rl: false }),
+            (amos(3, 3, 2, 3, 1), Inst::Amo { op: AmoOp::ScD, rd: 1, rs1: 2, rs2: 3, aq: false, rl: false }),
+        ]);
+    }
+
+    #[test]
+    fn illegal() {
+        chk([
+            (0xFFFFFFFF, Inst::Illegal(0xFFFFFFFF)),
+            (i(0x100, 2, 7, 1, 0x03), Inst::Illegal(i(0x100, 2, 7, 1, 0x03))),
+            (s(0x108, 3, 2, 7), Inst::Illegal(s(0x108, 3, 2, 7))),
+        ]);
     }
 }

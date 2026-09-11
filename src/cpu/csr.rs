@@ -40,6 +40,16 @@ pub const MSTATUS_FS: u64 = 0b11 << 13;
 pub const MSTATUS_XS: u64 = 0b11 << 15;
 pub const MSTATUS_VS: u64 = 0b11 << 9;
 
+/// Bits of mstatus exposed to S-mode through sstatus (read & write gate).
+const SSTATUS_MASK: u64 = MSTATUS_SPP
+    | MSTATUS_SPIE
+    | MSTATUS_SIE
+    | MSTATUS_FS
+    | MSTATUS_XS
+    | MSTATUS_VS
+    | MSTATUS_SUM
+    | MSTATUS_MXR;
+
 pub const MIP_SSIP: u64 = 1 << 1;
 pub const MIP_STIP: u64 = 1 << 5;
 pub const MIP_SEIP: u64 = 1 << 9;
@@ -62,8 +72,8 @@ impl CsrFile {
             regs: [0u64; NUM_CSRS],
             stimecmp: u64::MAX,
         };
-        s.regs[CSR_MISA] = (2u64 << 62) | (1 << 0) | (1 << 8) | (1 << 12);
-        s.regs[CSR_MEDELEG] = (1 << 3) | (1 << 8) | (1 << 9) | (1 << 12) | (1 << 13) | (1 << 15);
+        s.regs[CSR_MISA] = (2u64 << 62) | (1 << 0) | (1 << 8) | (1 << 12);                        // MXL=2 (RV64), A, I, M extensions
+        s.regs[CSR_MEDELEG] = (1 << 3) | (1 << 8) | (1 << 9) | (1 << 12) | (1 << 13) | (1 << 15); // delegate exceptions to S-mode
         s.regs[CSR_MIDELEG] = MIP_SSIP | MIP_STIP | MIP_SEIP;
         s
     }
@@ -73,17 +83,7 @@ impl CsrFile {
             return 0;
         }
         match addr {
-            CSR_SSTATUS => {
-                self.regs[CSR_MSTATUS]
-                    & (MSTATUS_SPP
-                        | MSTATUS_SPIE
-                        | MSTATUS_SIE
-                        | MSTATUS_FS
-                        | MSTATUS_XS
-                        | MSTATUS_VS
-                        | MSTATUS_SUM
-                        | MSTATUS_MXR)
-            }
+            CSR_SSTATUS => self.regs[CSR_MSTATUS] & SSTATUS_MASK,
             CSR_SIE => self.regs[CSR_MIE] & self.regs[CSR_MIDELEG],
             CSR_SIP => self.regs[CSR_MIP] & self.regs[CSR_MIDELEG],
             CSR_SATP if priv_level == Privilege::S => self.regs[CSR_SATP],
@@ -112,15 +112,8 @@ impl CsrFile {
         match addr {
             CSR_CYCLE | CSR_TIME | CSR_INSTRET => {}
             CSR_SSTATUS => {
-                let mask = MSTATUS_SPP
-                    | MSTATUS_SPIE
-                    | MSTATUS_SIE
-                    | MSTATUS_FS
-                    | MSTATUS_XS
-                    | MSTATUS_VS
-                    | MSTATUS_SUM
-                    | MSTATUS_MXR;
-                self.regs[CSR_MSTATUS] = (self.regs[CSR_MSTATUS] & !mask) | (val & mask);
+                self.regs[CSR_MSTATUS] =
+                    (self.regs[CSR_MSTATUS] & !SSTATUS_MASK) | (val & SSTATUS_MASK);
             }
             CSR_SIE => {
                 let mask = self.regs[CSR_MIDELEG] & (MIP_SSIP | MIP_STIP | MIP_SEIP);
@@ -171,29 +164,14 @@ impl CsrFile {
         self.regs[CSR_MIP]
     }
 
-    pub fn set_mip_timer(&mut self) {
-        self.regs[CSR_MIP] |= MIP_MTIP;
+    /// Set one or more MIP bits (raise an interrupt source).
+    pub fn set_mip(&mut self, bits: u64) {
+        self.regs[CSR_MIP] |= bits;
     }
-    pub fn clear_mip_timer(&mut self) {
-        self.regs[CSR_MIP] &= !MIP_MTIP;
-    }
-    pub fn set_mip_stimer(&mut self) {
-        self.regs[CSR_MIP] |= MIP_STIP;
-    }
-    pub fn clear_mip_stimer(&mut self) {
-        self.regs[CSR_MIP] &= !MIP_STIP;
-    }
-    pub fn set_mip_seip(&mut self) {
-        self.regs[CSR_MIP] |= MIP_SEIP;
-    }
-    pub fn clear_mip_seip(&mut self) {
-        self.regs[CSR_MIP] &= !MIP_SEIP;
-    }
-    pub fn set_mip_ssip(&mut self) {
-        self.regs[CSR_MIP] |= MIP_SSIP;
-    }
-    pub fn clear_mip_ssip(&mut self) {
-        self.regs[CSR_MIP] &= !MIP_SSIP;
+
+    /// Clear one or more MIP bits (deassert an interrupt source).
+    pub fn clear_mip(&mut self, bits: u64) {
+        self.regs[CSR_MIP] &= !bits;
     }
 
     pub fn inc_cycle(&mut self) {
@@ -387,23 +365,23 @@ mod tests {
         csr.write(CSR_CYCLE, 42, Privilege::M);
         assert_eq!(csr.read(CSR_CYCLE, Privilege::M), 0); // writes to cycle are ignored
     }
-
+    
     // ---- MIP handling ----
     #[test]
     fn test_mip_timer() {
         let mut csr = CsrFile::new();
         assert_eq!(csr.mip() & MIP_MTIP, 0);
-        csr.set_mip_timer();
+        csr.set_mip(MIP_MTIP);
         assert!(csr.mip() & MIP_MTIP != 0);
-        csr.clear_mip_timer();
+        csr.clear_mip(MIP_MTIP);
         assert_eq!(csr.mip() & MIP_MTIP, 0);
     }
     #[test]
     fn test_mip_ssip() {
         let mut csr = CsrFile::new();
-        csr.set_mip_ssip();
+        csr.set_mip(MIP_SSIP);
         assert!(csr.mip() & MIP_SSIP != 0);
-        csr.clear_mip_ssip();
+        csr.clear_mip(MIP_SSIP);
         assert_eq!(csr.mip() & MIP_SSIP, 0);
     }
     #[test]

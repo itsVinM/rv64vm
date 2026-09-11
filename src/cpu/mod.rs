@@ -7,7 +7,7 @@ use crate::cpu::csr::{
     CSR_SEPC, CSR_STVAL, CSR_STVEC, MSTATUS_MIE, MSTATUS_MPIE, MSTATUS_MPP, MSTATUS_SIE,
     MSTATUS_SPIE, MSTATUS_SPP,
 };
-use crate::mmu::Mmu as Bus;
+use crate::Bus;
 use crate::traps::{pending_interrupt, TrapCause};
 use decoder::decode;
 use executor::execute;
@@ -40,7 +40,7 @@ impl Cpu {
         }
     }
 
-    pub fn step(&mut self, bus: &mut Bus) -> StepResult {
+    pub fn step<B: Bus>(&mut self, bus: &mut B) -> StepResult {
         if self.halted {
             return StepResult::Halted;
         }
@@ -66,14 +66,21 @@ impl Cpu {
             return StepResult::Ok;
         }
 
-        // Fetch with virtual memory translation
-        let fetch_pa = translate_fetch(
-            self.pc,
-            self.priv_level,
-            bus,
-            self.csr.read(csr::CSR_SATP, Privilege::M),
-        )
-        .unwrap_or(self.pc);
+        if self.pc & 3 != 0 {
+            let cause = TrapCause::InstructionAddressMisaligned;
+            self.take_trap(cause, self.pc, self.pc);
+            return StepResult::Trap(cause);
+        }
+
+        // Fetch with virtual memory translation — one shared page walker
+        // (executor::translate), raising the fault instead of aliasing VA→PA.
+        let fetch_pa = match executor::fetch_phys(self, bus) {
+            Ok(pa) => pa,
+            Err(cause) => {
+                self.take_trap(cause, self.pc, self.pc);
+                return StepResult::Trap(cause);
+            }
+        };
 
         let raw = match bus.read32(fetch_pa) {
             Ok(v) => v,
@@ -88,14 +95,7 @@ impl Cpu {
             }
         };
 
-        let result = execute(
-            decode(raw),
-            self.pc,
-            &mut self.regs,
-            &mut self.csr,
-            bus,
-            self.priv_level,
-        );
+        let result = execute(self, bus, decode(raw));
         self.csr.inc_instret();
 
         if result.halt {
@@ -185,60 +185,3 @@ impl Cpu {
         NAMES[r]
     }
 }
-
-fn translate_fetch(pc: u64, priv_level: Privilege, bus: &Bus, satp: u64) -> Result<u64, TrapCause> {
-    if priv_level == Privilege::M {
-        return Ok(pc);
-    }
-    let mode = (satp >> 60) & 0xF;
-    if mode == 0 {
-        return Ok(pc);
-    }
-    // Sv39 page walk for instruction fetch
-    let vpn2 = (pc >> 30) & 0x1FF;
-    let vpn1 = (pc >> 21) & 0x1FF;
-    let vpn0 = (pc >> 12) & 0x1FF;
-
-    let root_ppn = satp & ((1u64 << 44) - 1);
-    let mut pte_addr = (root_ppn << 12) + (vpn2 * 8);
-
-    let mut pte = match bus.read_phys64(pte_addr) {
-        Ok(v) => v,
-        Err(_) => return Err(TrapCause::InstructionPageFault),
-    };
-
-    if pte & 1 == 0 {
-        return Err(TrapCause::InstructionPageFault);
-    }
-
-    // Level at which the leaf PTE was found (2 = gigapage, 1 = megapage,
-    // 0 = 4 KiB page). Needed to merge VA index bits into the final PA.
-    let mut leaf_level = 2u64;
-    for (level, vpn) in [(1u64, vpn1), (0u64, vpn0)] {
-        if pte & (PTE_R | PTE_W | PTE_X) != 0 {
-            break;
-        }
-        let ppn = (pte >> 10) & 0x00FF_FFFF_FFFF;
-        pte_addr = (ppn << 12) + (vpn * 8);
-        pte = match bus.read_phys64(pte_addr) {
-            Ok(v) => v,
-            Err(_) => return Err(TrapCause::InstructionPageFault),
-        };
-        if pte & 1 == 0 {
-            return Err(TrapCause::InstructionPageFault);
-        }
-        leaf_level = level;
-    }
-
-    if pte & PTE_X == 0 {
-        return Err(TrapCause::InstructionPageFault);
-    }
-
-    let ppn = (pte >> 10) & 0x00FF_FFFF_FFFF;
-    let va_low_bits = 12 + leaf_level * 9;
-    Ok(((ppn << 12) & !((1u64 << va_low_bits) - 1)) | (pc & ((1u64 << va_low_bits) - 1)))
-}
-
-const PTE_R: u64 = 1 << 1;
-const PTE_W: u64 = 1 << 2;
-const PTE_X: u64 = 1 << 3;

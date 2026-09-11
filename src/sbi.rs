@@ -1,5 +1,5 @@
-use crate::mmu::Mmu;
 use crate::uart;
+use crate::Bus;
 
 // SBI extension IDs (legacy)
 pub const SBI_SET_TIMER: u64 = 0;
@@ -69,11 +69,18 @@ impl SbiResult {
     }
 }
 
-pub fn handle_sbi(a7: u64, a0: u64, _a1: u64, _a2: u64, a6: u64, bus: &mut Mmu) -> SbiResult {
+pub fn handle_sbi<B: Bus>(
+    a7: u64,
+    a0: u64,
+    _a1: u64,
+    _a2: u64,
+    a6: u64,
+    bus: &mut B,
+) -> SbiResult {
     match a7 {
         // Legacy extensions
         SBI_SET_TIMER => {
-            bus.clint.mtimecmp = a0;
+            bus.set_mtimecmp(a0);
             SbiResult::ok()
         }
         SBI_CONSOLE_PUTCHAR => {
@@ -91,7 +98,7 @@ pub fn handle_sbi(a7: u64, a0: u64, _a1: u64, _a2: u64, a6: u64, bus: &mut Mmu) 
         SBI_EXT_BASE => handle_sbi_base(a6, a0),
         SBI_EXT_TIME => match a6 {
             SBI_TIME_SET_TIMER => {
-                bus.clint.mtimecmp = a0;
+                bus.set_mtimecmp(a0);
                 SbiResult::ok()
             }
             _ => SbiResult::not_supported(),
@@ -106,12 +113,12 @@ pub fn handle_sbi(a7: u64, a0: u64, _a1: u64, _a2: u64, a6: u64, bus: &mut Mmu) 
     }
 }
 
-fn handle_sbi_dbcn(
+fn handle_sbi_dbcn<B: Bus>(
     func_id: u64,
     buf_addr: u64,
     buf_len: u64,
     _out_len_addr: u64,
-    bus: &mut Mmu,
+    bus: &mut B,
 ) -> SbiResult {
     match func_id {
         SBI_DBCN_CONSOLE_WRITE_BYTE => {

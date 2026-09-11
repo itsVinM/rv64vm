@@ -1,5 +1,8 @@
 use crate::mmu::DRAM_BASE;
 
+#[cfg(not(feature = "std"))]
+use alloc::{vec, vec::Vec};
+
 const MAGIC: u64 = 0x000;
 const VERSION: u64 = 0x004;
 const DEVICE_ID: u64 = 0x008;
