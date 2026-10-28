@@ -196,6 +196,8 @@ type Rs1 = BitField<15, 19>;
 type Rs2 = BitField<20, 24>;
 type Funct3 = BitField<12, 14>;
 type Funct7 = BitField<25, 31>;
+// RV64 64-bit shifts spend bit 25 on shamt[5], so their type field is only 6 bits.
+type Funct6 = BitField<26, 31>;
 type CsrBits = BitField<20, 31>;
 
 fn decode_lui(raw: u32) -> Inst {
@@ -256,10 +258,10 @@ fn decode_op_imm(raw: u32) -> Inst {
         4 => Inst::IAlu { op: IOp::Xori, rd, rs1, imm },
         6 => Inst::IAlu { op: IOp::Ori, rd, rs1, imm },
         7 => Inst::IAlu { op: IOp::Andi, rd, rs1, imm },
-        1 if Funct7::get(raw) == 0 => Inst::IAlu { op: IOp::Slli, rd, rs1, imm: shamt6(raw) },
-        5 => match Funct7::get(raw) {
+        1 if Funct6::get(raw) == 0 => Inst::IAlu { op: IOp::Slli, rd, rs1, imm: shamt6(raw) },
+        5 => match Funct6::get(raw) {
             0 => Inst::IAlu { op: IOp::Srli, rd, rs1, imm: shamt6(raw) },
-            0x20 => Inst::IAlu { op: IOp::Srai, rd, rs1, imm: shamt6(raw) },
+            0x10 => Inst::IAlu { op: IOp::Srai, rd, rs1, imm: shamt6(raw) },
             _ => Inst::Illegal(raw),
         },
         _ => Inst::Illegal(raw),
@@ -493,6 +495,11 @@ mod tests {
             ((5 << 20) | (2 << 15) | (1 << 12) | (1 << 7) | 0x13, Inst::IAlu { op: IOp::Slli, rd: 1, rs1: 2, imm: 5 }),
             ((5 << 20) | (2 << 15) | (5 << 12) | (1 << 7) | 0x13, Inst::IAlu { op: IOp::Srli, rd: 1, rs1: 2, imm: 5 }),
             ((0x10 << 26) | (5 << 20) | (2 << 15) | (5 << 12) | (1 << 7) | 0x13, Inst::IAlu { op: IOp::Srai, rd: 1, rs1: 2, imm: 5 }),
+            // shamt[5] shares bit 25 with the type field: shifts >= 32 must still decode.
+            ((32 << 20) | (2 << 15) | (1 << 12) | (1 << 7) | 0x13, Inst::IAlu { op: IOp::Slli, rd: 1, rs1: 2, imm: 32 }),
+            ((32 << 20) | (2 << 15) | (5 << 12) | (1 << 7) | 0x13, Inst::IAlu { op: IOp::Srli, rd: 1, rs1: 2, imm: 32 }),
+            ((0x10 << 26) | (32 << 20) | (2 << 15) | (5 << 12) | (1 << 7) | 0x13, Inst::IAlu { op: IOp::Srai, rd: 1, rs1: 2, imm: 32 }),
+            ((0x10 << 26) | (63 << 20) | (2 << 15) | (5 << 12) | (1 << 7) | 0x13, Inst::IAlu { op: IOp::Srai, rd: 1, rs1: 2, imm: 63 }),
         ]);
     }
 
