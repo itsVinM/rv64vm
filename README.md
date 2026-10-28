@@ -27,6 +27,7 @@ cargo run -- --sbi --debug kernel/build/kernel.elf
 |------|-------------|
 | `--sbi` / `-s` | Boot S-mode with DTB + SBI |
 | `--debug` / `-d` | Interactive debugger |
+| `--max` / `--steps` `<n>` | Headless run capped at n instructions |
 
 Boot contract for S-mode kernels: PC starts at `0x80200000` in S-mode with
 `a0 = hartid`, `a1 = DTB physical address`.
